@@ -27,6 +27,7 @@ import { listPiSessions, findPiSessionFile } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { promptToPiMessage } from './translate/prompt.js'
+import { toPromptUsage, type PiSessionStats, type PromptUsage } from './usage.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
@@ -380,7 +381,11 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       if (cmd === 'session') {
-        const stats = (await session.proc.getSessionStats()) as any
+        const stats = (await session.proc.getSessionStats()) as PiSessionStats & {
+          sessionId?: string
+          sessionFile?: string
+          totalMessages?: number
+        }
 
         const lines: string[] = []
         if (stats?.sessionId) lines.push(`Session: ${stats.sessionId}`)
@@ -801,7 +806,16 @@ export class PiAcpAgent implements ACPAgent {
     const stopReason: StopReason =
       result === 'error' ? (session.wasCancelRequested() ? 'cancelled' : 'end_turn') : result
 
-    return { stopReason }
+    // `usage` is not yet in the SDK's PromptResponse (ACP RFD #22); the intersection type
+    // is assignable to PromptResponse, so no cast is needed.
+    const response: PromptResponse & { usage?: PromptUsage } = { stopReason }
+    try {
+      const usage = toPromptUsage((await session.proc.getSessionStats()) as PiSessionStats)
+      if (usage) response.usage = usage
+    } catch {
+      // Usage is best-effort.
+    }
+    return response
   }
 
   async cancel(params: CancelNotification): Promise<void> {
