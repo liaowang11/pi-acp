@@ -27,6 +27,7 @@ import {
   isBashTool
 } from './translate/bash.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import { toUsageUpdate, type PiSessionStats, type UsageUpdate } from './usage.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -425,13 +426,14 @@ export class PiAcpSession {
     return this.cancelRequested
   }
 
-  private emit(update: SessionUpdate): void {
-    // Serialize update delivery.
+  private emit(update: SessionUpdate | UsageUpdate): void {
+    // Serialize update delivery. `usage_update` is not yet in the SDK's SessionUpdate
+    // union (ACP RFD #22); the cast confines that single gap to one place.
     this.lastEmit = this.lastEmit
       .then(() =>
         this.conn.sessionUpdate({
           sessionId: this.sessionId,
-          update
+          update: update as SessionUpdate
         })
       )
       .catch(() => {
@@ -496,6 +498,15 @@ export class PiAcpSession {
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
+  }
+
+  private async emitUsageUpdate(): Promise<void> {
+    try {
+      const update = toUsageUpdate((await this.proc.getSessionStats()) as PiSessionStats)
+      if (update) this.emit(update)
+    } catch {
+      // Usage is best-effort; never break the session if stats are unavailable.
+    }
   }
 
   setExtensionCommandNames(names: Iterable<string>): void {
@@ -1023,8 +1034,12 @@ export class PiAcpSession {
         // at most that same turn, never a later queued one.
         if (!this.pendingTurn) break
         const token = this.pendingTurn.token
-        void this.flushEmits().finally(() => {
-          this.completeTurn(token, this.cancelRequested ? 'cancelled' : 'end_turn')
+        // Emit the authoritative usage_update, then deliver all pending updates before
+        // we resolve the ACP `session/prompt` request.
+        void this.emitUsageUpdate().finally(() => {
+          void this.flushEmits().finally(() => {
+            this.completeTurn(token, this.cancelRequested ? 'cancelled' : 'end_turn')
+          })
         })
         break
       }
