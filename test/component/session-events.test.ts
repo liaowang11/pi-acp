@@ -740,3 +740,212 @@ test('PiAcpSession: expands /command before sending to pi', async () => {
   const reason = await p
   assert.equal(reason, 'end_turn')
 })
+
+test('PiAcpSession: extension command with setStatus only resolves end_turn (no agent events)', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Simulate /cache graph: setStatus emitted before prompt resolves, no agent events ever.
+  proc.queuePromptEvents([{ type: 'extension_ui_request', id: 'ext-1', method: 'setStatus', statusKey: 'codex-goal' }])
+
+  const p = session.prompt('/cache graph')
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+})
+
+test('PiAcpSession: extension command with notify resolves end_turn (no agent events)', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Simulate /cache: setStatus then notify before prompt resolves
+  proc.queuePromptEvents([
+    { type: 'extension_ui_request', id: 'ext-1', method: 'setStatus', statusKey: 'codex-goal' },
+    {
+      type: 'extension_ui_request',
+      id: 'ext-2',
+      method: 'notify',
+      message: 'Usage: /cache graph | /cache stats | /cache export',
+      notifyType: 'info'
+    }
+  ])
+
+  const p = session.prompt('/cache')
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+
+  // Verify the notify content was surfaced as agent_message_chunk
+  const messages = conn.updates.filter(u => u.update.sessionUpdate === 'agent_message_chunk')
+  assert.ok(messages.length >= 1, 'expected at least one agent_message_chunk for notify content')
+})
+
+test('PiAcpSession: normal prompt after extension command works correctly', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // First prompt: extension command
+  proc.queuePromptEvents([{ type: 'extension_ui_request', id: 'ext-1', method: 'setStatus', statusKey: 'codex-goal' }])
+  const p1 = session.prompt('/cache graph')
+  const reason1 = await p1
+  assert.equal(reason1, 'end_turn')
+
+  // Second prompt: normal LLM prompt — agent events arrive in same batch as prompt resolution
+  proc.queuePromptEvents([
+    { type: 'agent_start' },
+    { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'Hi!' } },
+    { type: 'turn_end' },
+    { type: 'agent_end' }
+  ])
+  const p2 = session.prompt('say hi')
+  const reason2 = await p2
+  assert.equal(reason2, 'end_turn')
+})
+
+test('PiAcpSession: does not complete a normal prompt early when agent_start arrives after the prompt ack', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Real pi ordering: the prompt ack is emitted before the agent loop starts, and pi has
+  // already set isStreaming=true by then. agent_start arrives only afterwards.
+  proc.streaming = true
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // Let the prompt ack resolve and the get_state fence run. Because pi reports isStreaming, the
+  // turn must NOT be completed yet — agent_end is still to come.
+  await new Promise(r => setTimeout(r, 0))
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must not resolve before agent_end')
+
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'turn_end' })
+  proc.emit({ type: 'agent_end' })
+
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+  assert.equal(resolved, true)
+})
+
+test('PiAcpSession: a duplicate agent_end does not resolve a queued follow-up turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Both turns are normal prompts; pi keeps reporting isStreaming across the queued turns.
+  proc.streaming = true
+
+  const first = session.prompt('one')
+  proc.emit({ type: 'agent_start' })
+
+  let secondResolved = false
+  const second = session.prompt('two').then(reason => {
+    secondResolved = true
+    return reason
+  })
+
+  // pi ends turn one, then erroneously emits a second agent_end.
+  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_end' })
+
+  const r1 = await first
+  assert.equal(r1, 'end_turn')
+
+  // The stray agent_end must not have completed the queued turn two.
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(secondResolved, false, 'duplicate agent_end must not resolve turn two')
+
+  // Turn two completes on its own agent_end.
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end' })
+
+  const r2 = await second
+  assert.equal(r2, 'end_turn')
+})
+
+test('PiAcpSession: a detached extension command cannot let a later stray agent_end resolve the next real prompt', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const detached = (session as any).prompt('/cache graph', [], { detached: true })
+  assert.equal(await detached, 'end_turn')
+
+  // Simulate an async extension-triggered run starting after the detached command already resolved.
+  proc.streaming = true
+
+  let resolved = false
+  const realPrompt = session.prompt('real prompt').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // Cleanup should abort the leftover run, but a late agent_end from that run must not resolve the
+  // new prompt before its own agent_start arrives.
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(proc.abortCount, 1)
+
+  proc.emit({ type: 'agent_end' })
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'stray agent_end from detached command must not resolve the real prompt')
+
+  proc.streaming = false
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end' })
+
+  assert.equal(await realPrompt, 'end_turn')
+})

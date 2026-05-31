@@ -55,3 +55,71 @@ test('PiAcpAgent: /name sets session display name adapter-side', async () => {
   const last = conn.updates.at(-1)
   assert.match((last as any).update.content.text, /Session name set: My Session/)
 })
+
+test('PiAcpAgent: known extension commands are detached from later real prompts', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+  proc.getCommands = async () => ({ commands: [{ name: 'cache', source: 'extension' }] })
+
+  let promptCall: { message: string; images: unknown[]; opts: unknown } | null = null
+  const session = {
+    sessionId: 's1',
+    proc,
+    fileCommands: [],
+    isExtensionCommand: async (name: string) => name === 'cache',
+    prompt: async (message: string, images: unknown[], opts: unknown) => {
+      promptCall = { message, images, opts }
+      return 'end_turn'
+    },
+    wasCancelRequested: () => false
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  const res = await agent.prompt({
+    sessionId: 's1',
+    prompt: [{ type: 'text', text: '/cache graph' }]
+  } as any)
+
+  assert.equal(res.stopReason, 'end_turn')
+  assert.deepEqual(promptCall, {
+    message: '/cache graph',
+    images: [],
+    opts: { detached: true }
+  })
+})
+
+test('PiAcpAgent: prompt-template commands stay on the normal prompt path', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+  proc.getCommands = async () => ({ commands: [{ name: 'review', source: 'prompt' }] })
+
+  let promptCall: { message: string; images: unknown[]; opts: unknown } | null = null
+  const session = {
+    sessionId: 's1',
+    proc,
+    fileCommands: [],
+    isExtensionCommand: async () => false,
+    prompt: async (message: string, images: unknown[], opts: unknown) => {
+      promptCall = { message, images, opts }
+      return 'end_turn'
+    },
+    wasCancelRequested: () => false
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  const res = await agent.prompt({
+    sessionId: 's1',
+    prompt: [{ type: 'text', text: '/review src/acp/session.ts' }]
+  } as any)
+
+  assert.equal(res.stopReason, 'end_turn')
+  assert.deepEqual(promptCall, {
+    message: '/review src/acp/session.ts',
+    images: [],
+    opts: undefined
+  })
+})

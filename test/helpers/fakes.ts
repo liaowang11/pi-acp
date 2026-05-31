@@ -30,6 +30,16 @@ export class FakePiRpcProcess {
   readonly extensionUiResponses: unknown[] = []
   abortCount = 0
 
+  // When set, prompt() delays resolution and emits queued events before resolving.
+  // This simulates real pi's stdout ordering where events arrive before the response line.
+  private promptEvents: PiRpcEvent[] | null = null
+
+  // Mirrors pi's session.isStreaming, reported by getState(). Real pi sets this true synchronously
+  // before emitting the prompt ack of a prompt that starts an agent loop, so a normal-prompt test
+  // sets it true to model the window after the ack but before agent_start is emitted; an extension
+  // command that runs no agent loop leaves it false.
+  streaming = false
+
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
     this.handlers.push(handler)
     return () => {
@@ -41,8 +51,24 @@ export class FakePiRpcProcess {
     for (const h of this.handlers) h(ev)
   }
 
+  /**
+   * Queue events to emit before the next prompt() resolves.
+   * Simulates real pi's stdout ordering: events arrive on readline before the response line.
+   */
+  queuePromptEvents(events: PiRpcEvent[]): void {
+    this.promptEvents = events
+  }
+
   async prompt(message: string, attachments: unknown[] = []): Promise<void> {
     this.prompts.push({ message, attachments })
+    if (this.promptEvents) {
+      const events = this.promptEvents
+      this.promptEvents = null
+      // Emit queued events synchronously (like readline processing lines before response)
+      for (const ev of events) {
+        for (const h of this.handlers) h(ev)
+      }
+    }
   }
 
   async abort(): Promise<void> {
@@ -54,7 +80,7 @@ export class FakePiRpcProcess {
   }
 
   async getState(): Promise<any> {
-    return {}
+    return { isStreaming: this.streaming }
   }
 
   async getAvailableModels(): Promise<any> {

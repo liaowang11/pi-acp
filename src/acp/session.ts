@@ -1,12 +1,12 @@
 import type {
-    AgentSideConnection,
-    ContentBlock,
-    McpServer,
-    PermissionOption,
-    SessionUpdate,
-    ToolCallContent,
-    ToolCallLocation,
-    ToolKind
+  AgentSideConnection,
+  ContentBlock,
+  McpServer,
+  PermissionOption,
+  SessionUpdate,
+  ToolCallContent,
+  ToolCallLocation,
+  ToolKind
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
 import { readFileSync } from 'node:fs'
@@ -30,13 +30,19 @@ export type StopReason = 'end_turn' | 'cancelled' | 'error'
 type PendingTurn = {
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
+  token: number
 }
 
 type QueuedTurn = {
   message: string
   images: unknown[]
+  detached: boolean
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
+}
+
+type PromptOptions = {
+  detached?: boolean
 }
 
 type PermissionResponse = Awaited<ReturnType<AgentSideConnection['requestPermission']>>
@@ -202,7 +208,22 @@ export class PiAcpSession {
 
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
+  // True while we are preparing the next turn (e.g. cleaning up a detached extension command)
+  // but have not yet bound pendingTurn to it. This keeps later prompts queued behind it.
+  private startingTurn = false
+  // Monotonic id stamped on each turn so a delayed completion (the get_state fence below) or a
+  // stray pi event can only resolve the turn it belongs to, never a later one.
+  private turnSeq = 0
   private readonly turnQueue: QueuedTurn[] = []
+  // Known pi extension command names, populated from get_commands when available and refreshed
+  // lazily on demand. Only these are treated as detached ACP control actions.
+  private extensionCommandNames: Set<string> | null = null
+  // A detached extension command already returned to the client. Before the next real prompt we
+  // abort any leftover background run so it cannot hold the queue open.
+  private detachedCommandPendingCleanup = false
+  // After aborting a leftover detached command run, ignore pi events until the next owned
+  // agent_start. This drops the orphan agent_end/output that would otherwise be misattributed.
+  private suppressOrphanEventsUntilNextAgentStart = false
   // Track tool call statuses and ensure they are monotonic (pending -> in_progress -> completed).
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
@@ -270,7 +291,7 @@ export class PiAcpSession {
     })
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
+  async prompt(message: string, images: unknown[] = [], opts?: PromptOptions): Promise<StopReason> {
     // Keep a prompt-path fallback because some clients may ignore the best-effort
     // pre-prompt notification sent right after session/new.
     this.sendStartupInfoOnFirstPromptIfPending()
@@ -279,10 +300,16 @@ export class PiAcpSession {
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject }
+      const queued: QueuedTurn = {
+        message: expandedMessage,
+        images,
+        detached: opts?.detached === true,
+        resolve,
+        reject
+      }
 
-      // If a turn is already running, enqueue.
-      if (this.pendingTurn) {
+      // If a turn is already running or being prepared, enqueue.
+      if (this.pendingTurn || this.startingTurn) {
         this.turnQueue.push(queued)
 
         // Best-effort: notify client that a prompt was queued.
@@ -357,11 +384,88 @@ export class PiAcpSession {
     await this.lastEmit
   }
 
+  setExtensionCommandNames(names: Iterable<string>): void {
+    this.extensionCommandNames = new Set(names)
+  }
+
+  async isExtensionCommand(name: string): Promise<boolean> {
+    if (!name) return false
+
+    if (!this.extensionCommandNames) {
+      try {
+        const data = (await this.proc.getCommands()) as
+          | { commands?: Array<{ name?: unknown; source?: unknown }> }
+          | {
+              data?: { commands?: Array<{ name?: unknown; source?: unknown }> }
+            }
+        const commands: Array<{ name?: unknown; source?: unknown }> = Array.isArray((data as any)?.commands)
+          ? (data as any).commands
+          : Array.isArray((data as any)?.data?.commands)
+            ? (data as any).data.commands
+            : []
+        this.extensionCommandNames = new Set(
+          commands
+            .filter((c: { name?: unknown; source?: unknown }) => c.source === 'extension' && typeof c.name === 'string')
+            .map((c: { name?: unknown; source?: unknown }) => String(c.name).trim())
+            .filter(Boolean)
+        )
+      } catch {
+        this.extensionCommandNames = new Set()
+      }
+    }
+
+    return this.extensionCommandNames.has(name)
+  }
+
+  private completeTurn(token: number, reason: StopReason): void {
+    if (this.pendingTurn?.token !== token) return
+
+    this.pendingTurn.resolve(reason)
+    this.pendingTurn = null
+    this.inAgentLoop = false
+
+    const next = this.turnQueue.shift()
+    if (next) {
+      this.emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+      })
+      this.startTurn(next)
+    } else {
+      this.emit({
+        sessionUpdate: 'session_info_update',
+        _meta: { piAcp: { queueDepth: 0, running: false } }
+      })
+    }
+  }
+
   private startTurn(t: QueuedTurn): void {
+    if (!t.detached && this.detachedCommandPendingCleanup) {
+      this.startingTurn = true
+      void this.prepareAndStartTurn(t)
+      return
+    }
+
+    this.beginTurn(t)
+  }
+
+  private async prepareAndStartTurn(t: QueuedTurn): Promise<void> {
+    try {
+      await this.cleanupDetachedCommandRun()
+      this.startingTurn = false
+      this.beginTurn(t)
+    } catch (err) {
+      this.startingTurn = false
+      t.reject(err)
+    }
+  }
+
+  private beginTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
 
-    this.pendingTurn = { resolve: t.resolve, reject: t.reject }
+    const token = ++this.turnSeq
+    this.pendingTurn = { resolve: t.resolve, reject: t.reject, token }
 
     // Publish queue depth (0 because we're starting the turn now).
     this.emit({
@@ -369,38 +473,117 @@ export class PiAcpSession {
       _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
     })
 
-    // Kick off pi, but completion is determined by pi events, not the RPC response.
-    // Important: pi may emit multiple `turn_end` events (e.g. when the model requests tools).
-    // The full prompt is finished when we see `agent_end`.
-    this.proc.prompt(t.message, t.images).catch(err => {
-      // If the subprocess errors before we get an `agent_end`, treat as error unless cancelled.
-      // Also ensure we flush any already-enqueued updates first.
-      void this.flushEmits().finally(() => {
-        // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
-        const authErr = maybeAuthRequiredError(err)
-        if (authErr) {
-          this.pendingTurn?.reject(authErr)
-        } else {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
+    // Kick off pi. Completion is normally determined by pi's `agent_end` event, not the RPC
+    // response: pi may emit multiple `turn_end` events (e.g. when the model requests tools),
+    // and the prompt RPC response is only an early "preflight accepted" ack emitted before the
+    // agent loop runs. The ambiguous case is handled in maybeCompleteAfterAck.
+    this.proc
+      .prompt(t.message, t.images)
+      .then(() => {
+        if (t.detached) {
+          this.detachedCommandPendingCleanup = true
+          void this.flushEmits().finally(() => {
+            this.completeTurn(token, this.cancelRequested ? 'cancelled' : 'end_turn')
+          })
+          return
         }
 
-        this.pendingTurn = null
-        this.inAgentLoop = false
-
-        // If the prompt failed, do not automatically proceed—pi may be unhealthy.
-        // But we still clear the queueDepth metadata.
-        this.emit({
-          sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
-        })
+        void this.maybeCompleteAfterAck(token)
       })
-      void err
-    })
+      .catch(err => {
+        // If the subprocess errors before we get an `agent_end`, treat as error unless cancelled.
+        // Also ensure we flush any already-enqueued updates first.
+        void this.flushEmits().finally(() => {
+          if (this.pendingTurn?.token !== token) return
+
+          // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
+          const authErr = maybeAuthRequiredError(err)
+          if (authErr) {
+            this.pendingTurn.reject(authErr)
+          } else {
+            this.pendingTurn.resolve(this.cancelRequested ? 'cancelled' : 'error')
+          }
+
+          this.pendingTurn = null
+          this.inAgentLoop = false
+
+          // If the prompt failed, do not automatically proceed—pi may be unhealthy.
+          // But we still clear the queueDepth metadata.
+          this.emit({
+            sessionUpdate: 'session_info_update',
+            _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+          })
+        })
+        void err
+      })
+  }
+
+  private async cleanupDetachedCommandRun(): Promise<void> {
+    if (!this.detachedCommandPendingCleanup) return
+
+    this.detachedCommandPendingCleanup = false
+
+    let shouldAbort = true
+    try {
+      const state = (await this.proc.getState()) as { isStreaming?: unknown } | null
+      shouldAbort = Boolean(state?.isStreaming)
+    } catch {
+      // If pi state is unavailable, still try aborting so the detached command cannot hold the queue.
+    }
+
+    if (!shouldAbort) return
+
+    this.suppressOrphanEventsUntilNextAgentStart = true
+    try {
+      await this.proc.abort()
+    } catch {
+      // Best-effort cleanup only. We still proceed so a detached command can never block a real prompt.
+    }
+  }
+
+  /**
+   * Decide turn completion once pi has acked the prompt.
+   *
+   * The prompt RPC response is an early "preflight accepted" ack, emitted before pi's agent loop
+   * runs. If `agent_start` already arrived, `agent_end` will complete the turn. Otherwise we can't
+   * yet tell a command that runs no agent loop (e.g. /cache, /context) apart from an agent loop
+   * that simply hasn't emitted `agent_start` yet. Ask pi: it sets `isStreaming` synchronously
+   * before emitting the ack, so a `false` answer is authoritative — no agent loop will run, and we
+   * complete the turn now instead of hanging.
+   */
+  private async maybeCompleteAfterAck(token: number): Promise<void> {
+    if (this.inAgentLoop || this.pendingTurn?.token !== token) return
+
+    let streaming = false
+    try {
+      const state = (await this.proc.getState()) as { isStreaming?: unknown } | null
+      streaming = Boolean(state?.isStreaming)
+    } catch {
+      // If pi's state is unreachable, prefer completing the turn over hanging forever.
+    }
+
+    if (streaming || this.inAgentLoop || this.pendingTurn?.token !== token) return
+
+    await this.flushEmits()
+    this.completeTurn(token, this.cancelRequested ? 'cancelled' : 'end_turn')
   }
 
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
+
+    if (this.suppressOrphanEventsUntilNextAgentStart && !this.inAgentLoop) {
+      if (type === 'agent_start') {
+        this.suppressOrphanEventsUntilNextAgentStart = false
+      } else {
+        if (type === 'extension_ui_request') {
+          const id = stringProp(ev, 'id')
+          if (id) {
+            void this.proc.sendExtensionUiResponse({ id, cancelled: true }).catch(() => {})
+          }
+        }
+        return
+      }
+    }
 
     switch (type) {
       case 'message_update': {
@@ -668,28 +851,12 @@ export class PiAcpSession {
       }
 
       case 'agent_end': {
-        // Ensure all updates derived from pi events are delivered before we resolve
-        // the ACP `session/prompt` request.
+        // Bind this completion to the current turn. A duplicate/stray agent_end then resolves at
+        // most that same turn (completeTurn is a no-op once it has run), never a later queued one.
+        if (!this.pendingTurn) break
+        const token = this.pendingTurn.token
         void this.flushEmits().finally(() => {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-          this.pendingTurn?.resolve(reason)
-          this.pendingTurn = null
-          this.inAgentLoop = false
-
-          // Start next queued prompt, if any.
-          const next = this.turnQueue.shift()
-          if (next) {
-            this.emit({
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-            })
-            this.startTurn(next)
-          } else {
-            this.emit({
-              sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
-            })
-          }
+          this.completeTurn(token, this.cancelRequested ? 'cancelled' : 'end_turn')
         })
         break
       }
