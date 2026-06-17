@@ -4,6 +4,8 @@ import {
   type AgentSideConnection,
   type AuthenticateRequest,
   type CancelNotification,
+  type ForkSessionRequest,
+  type ForkSessionResponse,
   type InitializeRequest,
   type InitializeResponse,
   type ListSessionsRequest,
@@ -13,6 +15,8 @@ import {
   type NewSessionRequest,
   type PromptRequest,
   type PromptResponse,
+  type ResumeSessionRequest,
+  type ResumeSessionResponse,
   type SessionConfigOption,
   type SessionInfo,
   type SetSessionConfigOptionRequest,
@@ -44,7 +48,7 @@ import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-setti
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { isAbsolute } from 'node:path'
-import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
 import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -260,7 +264,9 @@ export class PiAcpAgent implements ACPAgent {
         sessionCapabilities: {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
           // Enables a native session picker in clients that support it.
-          list: {}
+          list: {},
+          resume: {},
+          fork: {}
         }
       }
     }
@@ -895,7 +901,7 @@ export class PiAcpAgent implements ACPAgent {
     await session.cancel()
   }
 
-  async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+  async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
     // ACP: filter by cwd if provided.
     // Zed currently sends `{}` (no cwd), so we default to the last session cwd to
     // emulate pi's `/resume` picker (project-scoped).
@@ -922,6 +928,194 @@ export class PiAcpAgent implements ACPAgent {
     const nextCursor = start + PAGE_SIZE < filtered.length ? String(start + PAGE_SIZE) : null
 
     return { sessions, nextCursor, _meta: {} }
+  }
+
+  async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    return this.listSessions(params)
+  }
+
+  async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    if (!isAbsolute(params.cwd)) {
+      throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
+    }
+
+    this.sessions.close(params.sessionId)
+    this.lastSessionCwd = params.cwd
+
+    const stored = this.findStoredSession(params.sessionId)
+    if (!stored) {
+      throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
+    }
+
+    const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const session = await this.restoreSession(params.sessionId, {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers
+    })
+    const proc = session.proc
+    const fileCommands = loadSlashCommands(params.cwd)
+
+    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
+
+    this.store.upsert({
+      sessionId: params.sessionId,
+      cwd: params.cwd,
+      sessionFile: stored.sessionFile
+    })
+
+    const { configOptions, models, modes } = await getSessionConfiguration(proc)
+
+    const response = {
+      configOptions,
+      models,
+      modes,
+      _meta: {
+        piAcp: {
+          startupInfo: null
+        }
+      }
+    }
+
+    setTimeout(() => {
+      void (async () => {
+        try {
+          const pi = (await proc.getCommands()) as any
+          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
+            enableSkillCommands,
+            includeExtensionCommands: false
+          })
+
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: mergeCommands(commands, builtinAvailableCommands())
+            }
+          })
+          return
+        } catch {
+          // fall back
+        }
+
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'available_commands_update',
+            availableCommands: mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+          }
+        })
+      })()
+    }, 0)
+
+    return response
+  }
+
+  async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    if (!isAbsolute(params.cwd)) {
+      throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
+    }
+
+    const stored = this.findStoredSession(params.sessionId)
+    if (!stored) {
+      throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
+    }
+
+    const forkSessionId = crypto.randomUUID()
+    const forkSessionFile = cloneSessionFile(stored.sessionFile, {
+      sessionId: forkSessionId,
+      cwd: params.cwd
+    })
+
+    let proc: PiRpcProcess
+    try {
+      proc = await PiRpcProcess.spawn({
+        cwd: params.cwd,
+        sessionPath: forkSessionFile,
+        piCommand: process.env.PI_ACP_PI_COMMAND
+      })
+    } catch (e: any) {
+      try {
+        if (existsSync(forkSessionFile)) unlinkSync(forkSessionFile)
+      } catch {
+        // ignore cleanup errors on failed fork
+      }
+
+      if (e?.name === 'PiRpcSpawnError') {
+        throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
+      }
+      throw e
+    }
+
+    const state = (await proc.getState().catch(() => null)) as any
+    const actualSessionId =
+      typeof state?.sessionId === 'string' && state.sessionId.trim() ? state.sessionId : forkSessionId
+    const actualSessionFile =
+      typeof state?.sessionFile === 'string' && state.sessionFile.trim() ? state.sessionFile : forkSessionFile
+
+    const fileCommands = loadSlashCommands(params.cwd)
+    const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const session = this.sessions.getOrCreate(actualSessionId, {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers,
+      conn: this.conn,
+      proc,
+      fileCommands
+    })
+
+    this.lastSessionCwd = params.cwd
+    this.store.upsert({
+      sessionId: actualSessionId,
+      cwd: params.cwd,
+      sessionFile: actualSessionFile
+    })
+    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
+
+    const { configOptions, models, modes } = await getSessionConfiguration(proc, { state })
+
+    const response = {
+      sessionId: actualSessionId,
+      configOptions,
+      models,
+      modes,
+      _meta: {
+        piAcp: {
+          startupInfo: null
+        }
+      }
+    }
+
+    setTimeout(() => {
+      void (async () => {
+        try {
+          const pi = (await proc.getCommands()) as any
+          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
+            enableSkillCommands,
+            includeExtensionCommands: false
+          })
+
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'available_commands_update',
+              availableCommands: mergeCommands(commands, builtinAvailableCommands())
+            }
+          })
+          return
+        } catch {
+          // fall back
+        }
+
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'available_commands_update',
+            availableCommands: mergeCommands(toAvailableCommands(fileCommands), builtinAvailableCommands())
+          }
+        })
+      })()
+    }, 0)
+
+    return response
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
@@ -1402,6 +1596,42 @@ async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Pr
   }
 
   await proc.setModel(provider, modelId)
+}
+
+function cloneSessionFile(sourcePath: string, opts: { sessionId: string; cwd: string }): string {
+  const raw = readFileSync(sourcePath, 'utf-8')
+  const newline = raw.includes('\r\n') ? '\r\n' : '\n'
+  const lines = raw.split(/\r?\n/)
+
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+
+  const headerLine = lines[0]?.trim()
+  if (!headerLine) {
+    throw new Error(`Cannot fork empty session file: ${sourcePath}`)
+  }
+
+  let header: any
+  try {
+    header = JSON.parse(headerLine)
+  } catch {
+    throw new Error(`Cannot fork invalid session file: ${sourcePath}`)
+  }
+
+  if (!header || typeof header !== 'object' || header.type !== 'session') {
+    throw new Error(`Cannot fork session file without a valid session header: ${sourcePath}`)
+  }
+
+  lines[0] = JSON.stringify({
+    ...header,
+    id: opts.sessionId,
+    cwd: opts.cwd,
+    timestamp: new Date().toISOString()
+  })
+
+  const safeSessionId = opts.sessionId.replace(/[^a-zA-Z0-9_-]/g, '_')
+  const forkPath = join(dirname(sourcePath), `${Date.now()}_${safeSessionId}.jsonl`)
+  writeFileSync(forkPath, lines.join(newline) + newline, 'utf-8')
+  return forkPath
 }
 
 function isSemver(v: string): boolean {

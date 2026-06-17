@@ -74,3 +74,45 @@ test('PiAcpAgent: unstable_listSessions defaults to lastSessionCwd when cwd para
     else process.env.PI_CODING_AGENT_DIR = oldEnv
   }
 })
+
+test('PiAcpAgent: listSessions delegates to session listing logic', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-test-'))
+  const dirA = join(root, 'sessions', '--a--')
+  mkdirSync(dirA, { recursive: true })
+
+  writeFileSync(
+    join(dirA, '1.jsonl'),
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'sess-a',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      cwd: '/cwd/a'
+    }) +
+      '\n' +
+      JSON.stringify({
+        type: 'session_info',
+        id: 'a1b2c3d4',
+        parentId: null,
+        timestamp: '2026-01-01T00:00:01.000Z',
+        name: 'A'
+      }) +
+      '\n',
+    { encoding: 'utf8' }
+  )
+
+  const oldEnv = process.env.PI_CODING_AGENT_DIR
+  process.env.PI_CODING_AGENT_DIR = root
+
+  try {
+    const conn = new FakeAgentSideConnection()
+    const agent = new PiAcpAgent(asAgentConn(conn))
+
+    const listed = await (agent as any).listSessions({ cwd: '/cwd/a', cursor: null, _meta: null })
+    assert.equal(listed.sessions.length, 1)
+    assert.equal(listed.sessions[0]?.sessionId, 'sess-a')
+  } finally {
+    if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = oldEnv
+  }
+})
