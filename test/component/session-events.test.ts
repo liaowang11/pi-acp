@@ -393,7 +393,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_retry_end', async () => {
   })
 })
 
-test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async () => {
+test('PiAcpSession: emits agent_message_chunk for compaction_start', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -406,7 +406,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async 
     fileCommands: []
   })
 
-  proc.emit({ type: 'auto_compaction_start' } as any)
+  proc.emit({ type: 'compaction_start', reason: 'threshold' } as any)
 
   await new Promise(r => setTimeout(r, 0))
 
@@ -417,7 +417,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async 
   })
 })
 
-test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async () => {
+test('PiAcpSession: emits agent_message_chunk for compaction_end', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -430,7 +430,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async ()
     fileCommands: []
   })
 
-  proc.emit({ type: 'auto_compaction_end' } as any)
+  proc.emit({ type: 'compaction_end', reason: 'threshold', willRetry: false } as any)
 
   await new Promise(r => setTimeout(r, 0))
 
@@ -1143,4 +1143,182 @@ test('PiAcpSession: a detached extension command cannot let a later stray agent_
   proc.emit({ type: 'agent_end' })
 
   assert.equal(await realPrompt, 'end_turn')
+})
+
+test('PiAcpSession: keeps the turn open across an auto-retry agent_end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // First attempt fails with a retryable error. pi signals it will auto-retry by setting
+  // willRetry on the agent_end, then runs a fresh agent loop for the retry.
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end', willRetry: true })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must stay open while pi auto-retries')
+
+  // The retry produces the real answer; its events must arrive while the turn is still active.
+  proc.emit({ type: 'auto_retry_start', attempt: 1, maxAttempts: 5, delayMs: 2000 })
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'answer' } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'end_turn')
+
+  const answer = conn.updates.find(
+    u => u.update.sessionUpdate === 'agent_message_chunk' && (u.update as any).content?.text === 'answer'
+  )
+  assert.ok(answer, 'retried answer must be delivered as an in-turn session/update')
+})
+
+test('PiAcpSession: keeps the turn open across overflow compaction-and-retry', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // Context overflow is not a transient retry (willRetry stays false on the agent_end); pi recovers
+  // by compacting and running another agent loop. The compaction_start arrives during the agent_end
+  // completion's settle and must hold the turn open.
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'compaction_start', reason: 'overflow' })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must stay open through overflow compaction')
+
+  proc.emit({ type: 'compaction_end', reason: 'overflow', willRetry: true })
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must stay open until the post-compaction loop ends')
+
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'answer' } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'end_turn')
+
+  const answer = conn.updates.find(
+    u => u.update.sessionUpdate === 'agent_message_chunk' && (u.update as any).content?.text === 'answer'
+  )
+  assert.ok(answer, 'post-compaction answer must be delivered as an in-turn session/update')
+})
+
+test('PiAcpSession: completes the turn after threshold compaction with no continuation', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // The agentic answer finishes, then pi compacts at the threshold. Threshold compaction runs no
+  // further loop (willRetry false), so the turn completes once compaction ends.
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'done' } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'compaction_start', reason: 'threshold' })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must not resolve while threshold compaction runs')
+
+  proc.emit({ type: 'compaction_end', reason: 'threshold', willRetry: false })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await p, 'end_turn')
+})
+
+test('PiAcpSession: keeps the turn open when pi continues with a queued follow-up', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // pi drains a queued follow-up by starting a fresh agent loop after the first agent_end. The new
+  // agent_start must cancel the first agent_end's pending completion.
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'agent_start' })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must stay open for the queued follow-up loop')
+
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'followup' } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await p, 'end_turn')
+})
+
+test('PiAcpSession: ignores manual compaction (no auto-compaction notice, no completion)', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Manual /compact is driven by its own builtin; its compaction events must not surface the
+  // automatic-compaction notice.
+  proc.emit({ type: 'compaction_start', reason: 'manual' })
+  proc.emit({ type: 'compaction_end', reason: 'manual', willRetry: false })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(conn.updates.length, 0)
 })

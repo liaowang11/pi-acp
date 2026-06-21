@@ -689,6 +689,7 @@ export class PiAcpSession {
     if (streaming || this.inAgentLoop || this.pendingTurn?.token !== token) return
 
     await this.flushEmits()
+    if (this.inAgentLoop || this.pendingTurn?.token !== token) return
     this.completeTurn(token, this.cancelRequested ? 'cancelled' : 'end_turn')
   }
 
@@ -989,25 +990,29 @@ export class PiAcpSession {
         break
       }
 
-      case 'auto_compaction_start': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Context nearing limit, running automatic compaction...'
-          } satisfies ContentBlock
-        })
+      case 'compaction_start': {
+        if (stringProp(ev, 'reason') !== 'manual') {
+          this.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: 'Context nearing limit, running automatic compaction...'
+            } satisfies ContentBlock
+          })
+        }
         break
       }
 
-      case 'auto_compaction_end': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Automatic compaction finished; context was summarized to continue the session.'
-          } satisfies ContentBlock
-        })
+      case 'compaction_end': {
+        if (stringProp(ev, 'reason') !== 'manual') {
+          this.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: 'Automatic compaction finished; context was summarized to continue the session.'
+            } satisfies ContentBlock
+          })
+        }
         break
       }
 
@@ -1034,8 +1039,6 @@ export class PiAcpSession {
         // at most that same turn, never a later queued one.
         if (!this.pendingTurn) break
         const token = this.pendingTurn.token
-        // Emit the authoritative usage_update, then deliver all pending updates before
-        // we resolve the ACP `session/prompt` request.
         void this.emitUsageUpdate().finally(() => {
           void this.flushEmits().finally(() => {
             this.completeTurn(token, this.cancelRequested ? 'cancelled' : 'end_turn')
