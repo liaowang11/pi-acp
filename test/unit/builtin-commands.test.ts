@@ -59,17 +59,16 @@ test('PiAcpAgent: /name sets session display name adapter-side', async () => {
   assert.match((last as any).update.content.text, /Session name set: My Session/)
 })
 
-test('PiAcpAgent: known extension commands are detached from later real prompts', async () => {
+test('PiAcpAgent: extension commands run on the normal prompt path', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess() as any
-  proc.getCommands = async () => ({ commands: [{ name: 'cache', source: 'extension' }] })
+  proc.getCommands = async () => ({ commands: [{ name: 'goal', source: 'extension' }] })
 
   let promptCall: { message: string; images: unknown[]; opts: unknown } | null = null
   const session = {
     sessionId: 's1',
     proc,
     fileCommands: [],
-    isExtensionCommand: async (name: string) => name === 'cache',
     prompt: async (message: string, images: unknown[], opts: unknown) => {
       promptCall = { message, images, opts }
       return 'end_turn'
@@ -80,16 +79,19 @@ test('PiAcpAgent: known extension commands are detached from later real prompts'
   const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).sessions = new FakeSessions(session) as any
 
+  // Extension commands such as /goal may queue a hidden follow-up agent turn. They must go through
+  // the normal completion path so the ACP turn stays open until pi is idle, not be force-completed
+  // at the prompt ack.
   const res = await agent.prompt({
     sessionId: 's1',
-    prompt: [{ type: 'text', text: '/cache graph' }]
+    prompt: [{ type: 'text', text: '/goal build the thing' }]
   } as any)
 
   assert.equal(res.stopReason, 'end_turn')
   assert.deepEqual(promptCall, {
-    message: '/cache graph',
+    message: '/goal build the thing',
     images: [],
-    opts: { detached: true }
+    opts: undefined
   })
 })
 

@@ -901,6 +901,26 @@ test('PiAcpSession: defaults notify severity to info when notifyType is absent',
   })
 })
 
+test('PiAcpSession: a TUI-only extension command that emits nothing resolves end_turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Simulate /usage: a TUI-overlay command whose ctx.ui.custom() is a no-op in pi RPC mode, so the
+  // handler returns having emitted no events and started no agent loop. pi reports idle at the ack.
+  const reason = await session.prompt('/usage')
+  assert.equal(reason, 'end_turn')
+  assert.equal(proc.abortCount, 0)
+})
+
 test('PiAcpSession: extension command with setStatus only resolves end_turn (no agent events)', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -980,7 +1000,8 @@ test('PiAcpSession: normal prompt after extension command works correctly', asyn
     { type: 'agent_start' },
     { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'Hi!' } },
     { type: 'turn_end' },
-    { type: 'agent_end' }
+    { type: 'agent_end' },
+    { type: 'agent_settled' }
   ])
   const p2 = session.prompt('say hi')
   const reason2 = await p2
@@ -1011,14 +1032,15 @@ test('PiAcpSession: does not complete a normal prompt early when agent_start arr
   })
 
   // Let the prompt ack resolve and the get_state fence run. Because pi reports isStreaming, the
-  // turn must NOT be completed yet — agent_end is still to come.
+  // turn must NOT be completed yet — agent settlement is still to come.
   await new Promise(r => setTimeout(r, 0))
   await new Promise(r => setTimeout(r, 0))
-  assert.equal(resolved, false, 'turn must not resolve before agent_end')
+  assert.equal(resolved, false, 'turn must not resolve before agent_settled')
 
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
 
   const reason = await p
   assert.equal(reason, 'end_turn')
@@ -1045,7 +1067,7 @@ test('PiAcpSession: does not complete a normal prompt early when get_state repor
   })
 
   // A normal prompt can still emit deltas after the prompt ack even if an immediate get_state
-  // check transiently reports isStreaming=false. The turn must stay open until agent_end.
+  // check transiently reports isStreaming=false. The turn must stay open until agent_settled.
   await new Promise(r => setTimeout(r, 0))
   await new Promise(r => setTimeout(r, 0))
   assert.equal(resolved, false, 'turn must not resolve before later prompt deltas arrive')
@@ -1054,6 +1076,7 @@ test('PiAcpSession: does not complete a normal prompt early when get_state repor
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'Hi!' } })
   proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
 
   const reason = await p
   assert.equal(reason, 'end_turn')
@@ -1088,6 +1111,7 @@ test('PiAcpSession: a duplicate agent_end does not resolve a queued follow-up tu
   // pi ends turn one, then erroneously emits a second agent_end.
   proc.emit({ type: 'agent_end' })
   proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
 
   const r1 = await first
   assert.equal(r1, 'end_turn')
@@ -1096,15 +1120,16 @@ test('PiAcpSession: a duplicate agent_end does not resolve a queued follow-up tu
   await new Promise(r => setTimeout(r, 0))
   assert.equal(secondResolved, false, 'duplicate agent_end must not resolve turn two')
 
-  // Turn two completes on its own agent_end.
+  // Turn two completes on its own settlement.
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
 
   const r2 = await second
   assert.equal(r2, 'end_turn')
 })
 
-test('PiAcpSession: a detached extension command cannot let a later stray agent_end resolve the next real prompt', async () => {
+test('PiAcpSession: keeps an extension-command turn open while pi reports a queued follow-up', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -1117,32 +1142,35 @@ test('PiAcpSession: a detached extension command cannot let a later stray agent_
     fileCommands: []
   })
 
-  const detached = (session as any).prompt('/cache graph', [], { detached: true })
-  assert.equal(await detached, 'end_turn')
-
-  // Simulate an async extension-triggered run starting after the detached command already resolved.
-  proc.streaming = true
+  // A /goal-style extension command records its goal and queues a hidden follow-up turn. At the
+  // prompt ack pi has not begun streaming yet, but already reports the queued work via get_state.
+  // The adapter must not complete the ACP turn at the ack; it must wait for the follow-up loop.
+  proc.streaming = false
+  proc.pendingMessages = 1
 
   let resolved = false
-  const realPrompt = session.prompt('real prompt').then(reason => {
+  const p = session.prompt('/goal build the thing').then(reason => {
     resolved = true
     return reason
   })
 
-  // Cleanup should abort the leftover run, but a late agent_end from that run must not resolve the
-  // new prompt before its own agent_start arrives.
   await new Promise(r => setTimeout(r, 0))
-  assert.equal(proc.abortCount, 1)
-
-  proc.emit({ type: 'agent_end' })
   await new Promise(r => setTimeout(r, 0))
-  assert.equal(resolved, false, 'stray agent_end from detached command must not resolve the real prompt')
+  assert.equal(resolved, false, 'turn must stay open while pi reports a queued follow-up')
 
-  proc.streaming = false
+  // The follow-up loop runs and finishes; its output must be delivered inside this turn.
+  proc.pendingMessages = 0
   proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'working on goal' } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'agent_settled' })
 
-  assert.equal(await realPrompt, 'end_turn')
+  assert.equal(await p, 'end_turn')
+  assert.equal(resolved, true)
+  const answer = conn.updates.find(
+    u => u.update.sessionUpdate === 'agent_message_chunk' && (u.update as any).content?.text === 'working on goal'
+  )
+  assert.ok(answer, 'follow-up output must be delivered as an in-turn session/update')
 })
 
 test('PiAcpSession: keeps the turn open across an auto-retry agent_end', async () => {

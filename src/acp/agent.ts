@@ -118,12 +118,6 @@ function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableC
   return out
 }
 
-function extensionCommandNamesFromRaw(raw: Array<{ name?: unknown; source?: unknown }>): string[] {
-  return raw
-    .filter(c => c?.source === 'extension' && typeof c?.name === 'string')
-    .map(c => String(c.name).trim())
-    .filter(Boolean)
-}
 import { fileURLToPath } from 'node:url'
 
 const pkg = readNearestPackageJson(import.meta.url)
@@ -407,11 +401,10 @@ export class PiAcpAgent implements ACPAgent {
       void (async () => {
         try {
           const pi = (await session.proc.getCommands()) as any
-          const { commands, raw } = toAvailableCommandsFromPiGetCommands(pi, {
+          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
             includeExtensionCommands: true
           })
-          session.setExtensionCommandNames(extensionCommandNamesFromRaw(raw))
 
           await this.conn.sessionUpdate({
             sessionId: session.sessionId,
@@ -895,15 +888,7 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    let detached = false
-    if (message.trimStart().startsWith('/')) {
-      const trimmed = message.trim()
-      const space = trimmed.indexOf(' ')
-      const cmd = space === -1 ? trimmed.slice(1) : trimmed.slice(1, space)
-      detached = await session.isExtensionCommand(cmd)
-    }
-
-    const result = await session.prompt(message, images, detached ? { detached: true } : undefined)
+    const result = await session.prompt(message, images)
 
     // ACP StopReason does not include "error"; if pi fails we map to end_turn for now,
     // unless we know this was a cancellation.
@@ -1108,11 +1093,10 @@ export class PiAcpAgent implements ACPAgent {
       void (async () => {
         try {
           const pi = (await proc.getCommands()) as any
-          const { commands, raw } = toAvailableCommandsFromPiGetCommands(pi, {
+          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
             includeExtensionCommands: true
           })
-          session.setExtensionCommandNames(extensionCommandNamesFromRaw(raw))
 
           await this.conn.sessionUpdate({
             sessionId: session.sessionId,

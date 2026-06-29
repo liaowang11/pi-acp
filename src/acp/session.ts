@@ -48,13 +48,8 @@ type PendingTurn = {
 type QueuedTurn = {
   message: string
   images: unknown[]
-  detached: boolean
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
-}
-
-type PromptOptions = {
-  detached?: boolean
 }
 
 type PermissionResponse = Awaited<ReturnType<AgentSideConnection['requestPermission']>>
@@ -280,22 +275,10 @@ export class PiAcpSession {
 
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
-  // True while we are preparing the next turn (e.g. cleaning up a detached extension command)
-  // but have not yet bound pendingTurn to it. This keeps later prompts queued behind it.
-  private startingTurn = false
   // Monotonic id stamped on each turn so a delayed completion (the get_state fence below) or a
   // stray pi event can only resolve the turn it belongs to, never a later one.
   private turnSeq = 0
   private readonly turnQueue: QueuedTurn[] = []
-  // Known pi extension command names, populated from get_commands when available and refreshed
-  // lazily on demand. Only these are treated as detached ACP control actions.
-  private extensionCommandNames: Set<string> | null = null
-  // A detached extension command already returned to the client. Before the next real prompt we
-  // abort any leftover background run so it cannot hold the queue open.
-  private detachedCommandPendingCleanup = false
-  // After aborting a leftover detached command run, ignore pi events until the next owned
-  // agent_start. This drops the orphan agent_end/output that would otherwise be misattributed.
-  private suppressOrphanEventsUntilNextAgentStart = false
   // Track tool call statuses and ensure they are monotonic (pending -> in_progress -> completed).
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
@@ -356,7 +339,7 @@ export class PiAcpSession {
     })
   }
 
-  async prompt(message: string, images: unknown[] = [], opts?: PromptOptions): Promise<StopReason> {
+  async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 
@@ -364,13 +347,12 @@ export class PiAcpSession {
       const queued: QueuedTurn = {
         message: expandedMessage,
         images,
-        detached: opts?.detached === true,
         resolve,
         reject
       }
 
-      // If a turn is already running or being prepared, enqueue.
-      if (this.pendingTurn || this.startingTurn) {
+      // If a turn is already running, enqueue.
+      if (this.pendingTurn) {
         this.turnQueue.push(queued)
 
         // Best-effort: notify client that a prompt was queued.
@@ -509,39 +491,6 @@ export class PiAcpSession {
     }
   }
 
-  setExtensionCommandNames(names: Iterable<string>): void {
-    this.extensionCommandNames = new Set(names)
-  }
-
-  async isExtensionCommand(name: string): Promise<boolean> {
-    if (!name) return false
-
-    if (!this.extensionCommandNames) {
-      try {
-        const data = (await this.proc.getCommands()) as
-          | { commands?: Array<{ name?: unknown; source?: unknown }> }
-          | {
-              data?: { commands?: Array<{ name?: unknown; source?: unknown }> }
-            }
-        const commands: Array<{ name?: unknown; source?: unknown }> = Array.isArray((data as any)?.commands)
-          ? (data as any).commands
-          : Array.isArray((data as any)?.data?.commands)
-            ? (data as any).data.commands
-            : []
-        this.extensionCommandNames = new Set(
-          commands
-            .filter((c: { name?: unknown; source?: unknown }) => c.source === 'extension' && typeof c.name === 'string')
-            .map((c: { name?: unknown; source?: unknown }) => String(c.name).trim())
-            .filter(Boolean)
-        )
-      } catch {
-        this.extensionCommandNames = new Set()
-      }
-    }
-
-    return this.extensionCommandNames.has(name)
-  }
-
   private completeTurn(token: number, reason: StopReason): void {
     if (this.pendingTurn?.token !== token) return
 
@@ -565,27 +514,6 @@ export class PiAcpSession {
   }
 
   private startTurn(t: QueuedTurn): void {
-    if (!t.detached && this.detachedCommandPendingCleanup) {
-      this.startingTurn = true
-      void this.prepareAndStartTurn(t)
-      return
-    }
-
-    this.beginTurn(t)
-  }
-
-  private async prepareAndStartTurn(t: QueuedTurn): Promise<void> {
-    try {
-      await this.cleanupDetachedCommandRun()
-      this.startingTurn = false
-      this.beginTurn(t)
-    } catch (err) {
-      this.startingTurn = false
-      t.reject(err)
-    }
-  }
-
-  private beginTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
 
@@ -605,14 +533,6 @@ export class PiAcpSession {
     this.proc
       .prompt(t.message, t.images)
       .then(() => {
-        if (t.detached) {
-          this.detachedCommandPendingCleanup = true
-          void this.flushEmits().finally(() => {
-            this.completeTurn(token, this.cancelRequested ? 'cancelled' : 'end_turn')
-          })
-          return
-        }
-
         void this.maybeCompleteAfterAck(token, t.message)
       })
       .catch(err => {
@@ -643,50 +563,39 @@ export class PiAcpSession {
       })
   }
 
-  private async cleanupDetachedCommandRun(): Promise<void> {
-    if (!this.detachedCommandPendingCleanup) return
-
-    this.detachedCommandPendingCleanup = false
-
-    let shouldAbort = true
-    try {
-      const state = (await this.proc.getState()) as { isStreaming?: unknown } | null
-      shouldAbort = Boolean(state?.isStreaming)
-    } catch {
-      // If pi state is unavailable, still try aborting so the detached command cannot hold the queue.
-    }
-
-    if (!shouldAbort) return
-
-    this.suppressOrphanEventsUntilNextAgentStart = true
-    try {
-      await this.proc.abort()
-    } catch {
-      // Best-effort cleanup only. We still proceed so a detached command can never block a real prompt.
-    }
-  }
-
   /**
-   * Decide turn completion once pi has acked the prompt.
+   * Decide turn completion once pi has acked a slash-command prompt.
    *
    * The prompt RPC response is an early "preflight accepted" ack, emitted before pi's agent loop
-   * runs. Normal prompts must stay open for `agent_settled` because pi can start streaming slightly
-   * later than our immediate state probe. The only safe fallback is slash-command-style prompts,
-   * where extension detection may have missed a command that runs no agent loop at all.
+   * runs. A slash command may run no agent loop at all (a pure UI/state command, which never emits
+   * `agent_settled`), or it may queue a hidden follow-up turn (e.g. `/goal <objective>`). pi runs the
+   * command handler — including any queued follow-up that flips `isStreaming` / increments
+   * `pendingMessageCount` — before emitting this ack, so the get_state probe below authoritatively
+   * distinguishes the two: if pi reports any in-flight or queued work, keep the turn open and let
+   * `agent_settled` complete it; otherwise the command finished synchronously and the turn ends now.
+   *
+   * Non-slash prompts always run an agent loop, so they skip this and complete on `agent_settled`.
    */
   private async maybeCompleteAfterAck(token: number, message: string): Promise<void> {
     if (this.inAgentLoop || this.pendingTurn?.token !== token) return
     if (!message.trimStart().startsWith('/')) return
 
-    let streaming = false
+    let busy = false
     try {
-      const state = (await this.proc.getState()) as { isStreaming?: unknown } | null
-      streaming = Boolean(state?.isStreaming)
+      const state = (await this.proc.getState()) as {
+        isStreaming?: unknown
+        isCompacting?: unknown
+        pendingMessageCount?: unknown
+      } | null
+      busy =
+        Boolean(state?.isStreaming) ||
+        Boolean(state?.isCompacting) ||
+        (typeof state?.pendingMessageCount === 'number' && state.pendingMessageCount > 0)
     } catch {
       // If pi's state is unreachable, prefer completing the turn over hanging forever.
     }
 
-    if (streaming || this.inAgentLoop || this.pendingTurn?.token !== token) return
+    if (busy || this.inAgentLoop || this.pendingTurn?.token !== token) return
 
     await this.flushEmits()
     if (this.inAgentLoop || this.pendingTurn?.token !== token) return
@@ -695,20 +604,6 @@ export class PiAcpSession {
 
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
-
-    if (this.suppressOrphanEventsUntilNextAgentStart && !this.inAgentLoop) {
-      if (type === 'agent_start') {
-        this.suppressOrphanEventsUntilNextAgentStart = false
-      } else {
-        if (type === 'extension_ui_request') {
-          const id = stringProp(ev, 'id')
-          if (id) {
-            void this.proc.sendExtensionUiResponse({ id, cancelled: true }).catch(() => {})
-          }
-        }
-        return
-      }
-    }
 
     switch (type) {
       case 'message_update': {

@@ -39,6 +39,11 @@ export class FakePiRpcProcess {
   // sets it true to model the window after the ack but before agent_start is emitted; an extension
   // command that runs no agent loop leaves it false.
   streaming = false
+  // Mirrors pi's session.isCompacting and session.pendingMessageCount, reported by getState().
+  // A command (e.g. /goal) that queues a hidden follow-up turn reports the queued work here even
+  // before its agent loop streams, so the adapter must keep the turn open while either is set.
+  compacting = false
+  pendingMessages = 0
 
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
     this.handlers.push(handler)
@@ -80,7 +85,7 @@ export class FakePiRpcProcess {
   }
 
   async getState(): Promise<any> {
-    return { isStreaming: this.streaming }
+    return { isStreaming: this.streaming, isCompacting: this.compacting, pendingMessageCount: this.pendingMessages }
   }
 
   async getAvailableModels(): Promise<any> {
