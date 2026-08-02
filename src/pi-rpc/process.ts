@@ -35,7 +35,12 @@ type PiRpcCommand =
   | { type: 'get_available_models'; id?: string }
   | { type: 'set_model'; id?: string; provider: string; modelId: string }
   // Thinking
-  | { type: 'set_thinking_level'; id?: string; level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' }
+  | { type: 'get_available_thinking_levels'; id?: string }
+  | {
+      type: 'set_thinking_level'
+      id?: string
+      level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+    }
   // Modes
   | { type: 'set_follow_up_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
   | { type: 'set_steering_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
@@ -258,7 +263,15 @@ export class PiRpcProcess {
     return res.data
   }
 
-  async setThinkingLevel(level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'): Promise<void> {
+  async getAvailableThinkingLevels(): Promise<unknown> {
+    const res = await this.request({ type: 'get_available_thinking_levels' })
+    if (!res.success) {
+      throw new Error(`pi get_available_thinking_levels failed: ${res.error ?? JSON.stringify(res.data)}`)
+    }
+    return res.data
+  }
+
+  async setThinkingLevel(level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'): Promise<void> {
     const res = await this.request({ type: 'set_thinking_level', level })
     if (!res.success) throw new Error(`pi set_thinking_level failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
