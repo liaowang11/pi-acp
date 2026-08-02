@@ -46,6 +46,9 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
             thinkingLevel: 'high',
             model: { provider: 'test', id: 'beta' }
           }
+        },
+        async getAvailableThinkingLevels() {
+          return { levels: ['off', 'high', 'max'] }
         }
       },
       setStartupInfo() {},
@@ -81,11 +84,8 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
         currentValue: 'high',
         options: [
           { value: 'off', name: 'Thinking: off', description: null },
-          { value: 'minimal', name: 'Thinking: minimal', description: null },
-          { value: 'low', name: 'Thinking: low', description: null },
-          { value: 'medium', name: 'Thinking: medium', description: null },
           { value: 'high', name: 'Thinking: high', description: null },
-          { value: 'xhigh', name: 'Thinking: xhigh', description: null }
+          { value: 'max', name: 'Thinking: max', description: null }
         ]
       }
     ])
@@ -169,6 +169,9 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
       async setThinkingLevel(level: string) {
         thinkingLevels.push(level)
         state.thinkingLevel = level
+      },
+      async getAvailableThinkingLevels() {
+        return { levels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] }
       }
     }
   }
@@ -179,17 +182,17 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
   const result = await agent.setSessionConfigOption({
     sessionId: 's1',
     configId: 'thought_level',
-    value: 'xhigh'
+    value: 'max'
   } as any)
 
-  assert.deepEqual(thinkingLevels, ['xhigh'])
-  assert.equal(result.configOptions.find(option => option.id === 'thought_level')?.currentValue, 'xhigh')
+  assert.deepEqual(thinkingLevels, ['max'])
+  assert.equal(result.configOptions.find(option => option.id === 'thought_level')?.currentValue, 'max')
   assert.deepEqual(conn.updates, [
     {
       sessionId: 's1',
       update: {
         sessionUpdate: 'current_mode_update',
-        currentModeId: 'xhigh'
+        currentModeId: 'max'
       }
     },
     {
