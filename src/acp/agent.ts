@@ -21,7 +21,9 @@ import {
   type SetSessionModeResponse,
   type StopReason,
   type DeleteSessionRequest,
-  type DeleteSessionResponse
+  type DeleteSessionResponse,
+  type ForkSessionRequest,
+  type ForkSessionResponse
 } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
@@ -266,7 +268,8 @@ export class PiAcpAgent implements ACPAgent {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
           // Enables a native session picker in clients that support it.
           list: {},
-          delete: {}
+          delete: {},
+          fork: {}
         }
       }
     }
@@ -290,6 +293,23 @@ export class PiAcpAgent implements ACPAgent {
       fileCommands,
       piCommand: process.env.PI_ACP_PI_COMMAND
     })
+
+    return this.finishSessionStartup(session, { cwd: params.cwd, fileCommands, enableSkillCommands })
+  }
+
+  /**
+   * Shared post-spawn setup for session/new and session/fork: probe state/models,
+   * build the response, and advertise slash commands.
+   */
+  private async finishSessionStartup(
+    session: PiAcpSession,
+    opts: {
+      cwd: string
+      fileCommands: ReturnType<typeof loadSlashCommands>
+      enableSkillCommands: ReturnType<typeof getEnableSkillCommands>
+    }
+  ) {
+    const { fileCommands, enableSkillCommands } = opts
 
     // Fetch state + models once (parallel) to reduce startup latency.
     let state: any = null
@@ -354,7 +374,7 @@ export class PiAcpAgent implements ACPAgent {
       availableModels
     })
 
-    const quietStartup = getQuietStartup(params.cwd)
+    const quietStartup = getQuietStartup(opts.cwd)
     const updateNotice = buildUpdateNotice()
 
     // If quietStartup is enabled, suppress the full "startup info" prelude, but still surface
@@ -364,7 +384,7 @@ export class PiAcpAgent implements ACPAgent {
         ? updateNotice + '\n'
         : ''
       : buildStartupInfo({
-          cwd: params.cwd,
+          cwd: opts.cwd,
           fileCommands,
           updateNotice
         })
@@ -430,6 +450,41 @@ export class PiAcpAgent implements ACPAgent {
     }, 0)
 
     return response
+  }
+
+  async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    if (!isAbsolute(params.cwd)) {
+      throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
+    }
+
+    const source = this.findStoredSession(params.sessionId)
+    if (!source) {
+      throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
+    }
+
+    // pi does not persist a session file until the first message, and `pi --fork`
+    // exits on a missing source file.
+    if (!existsSync(source.sessionFile)) {
+      throw RequestError.invalidParams(`Cannot fork session ${params.sessionId}: it has no persisted history yet`)
+    }
+
+    this.lastSessionCwd = params.cwd
+
+    const fileCommands = loadSlashCommands(params.cwd)
+    const enableSkillCommands = getEnableSkillCommands(params.cwd)
+
+    // pi copies the source conversation into a new session (new id + file) via `--fork`.
+    // The source session keeps its id, file, and (if live elsewhere) its own subprocess.
+    const session = await this.sessions.create({
+      cwd: params.cwd,
+      mcpServers: params.mcpServers ?? [],
+      conn: this.conn,
+      fileCommands,
+      forkPath: source.sessionFile,
+      piCommand: process.env.PI_ACP_PI_COMMAND
+    })
+
+    return this.finishSessionStartup(session, { cwd: params.cwd, fileCommands, enableSkillCommands })
   }
 
   async authenticate(_params: AuthenticateRequest) {

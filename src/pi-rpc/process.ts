@@ -79,6 +79,8 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  /** If set, pi forks this session file into a new session (via `--fork <path>`). */
+  forkPath?: string
 }
 
 export class PiRpcProcess {
@@ -141,6 +143,7 @@ export class PiRpcProcess {
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
+    if (params.forkPath) args.push('--fork', params.forkPath)
 
     const child = spawn(cmd, args, {
       cwd: params.cwd,
