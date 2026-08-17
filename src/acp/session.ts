@@ -35,6 +35,8 @@ type SessionCreateParams = {
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+  /** If set, pi forks this session file into a new session (`pi --fork <path>`). */
+  forkPath?: string
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -193,6 +195,7 @@ export class SessionManager {
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
+        ...(params.forkPath ? { forkPath: params.forkPath } : {}),
         piCommand: params.piCommand
       })
     } catch (e) {
