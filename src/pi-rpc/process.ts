@@ -27,8 +27,17 @@ function stripAnsi(s: string): string {
   return s.replace(ANSI_ESCAPE_REGEX, '')
 }
 
+/** How pi delivers a prompt that arrives while its agent loop is running. */
+export type PiStreamingBehavior = 'steer' | 'followUp'
+
 type PiRpcCommand =
-  | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
+  | {
+      type: 'prompt'
+      id?: string
+      message: string
+      images?: unknown[]
+      streamingBehavior?: PiStreamingBehavior
+    }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
   // Model
@@ -238,8 +247,23 @@ export class PiRpcProcess {
     return lines
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<void> {
-    const res = await this.request({ type: 'prompt', message, images })
+  /**
+   * Send a prompt to pi.
+   *
+   * STREAMING-BEHAVIOR is required when the agent loop is already running: pi
+   * rejects a plain prompt with "Agent is already processing. Specify
+   * streamingBehavior ('steer' or 'followUp') to queue the message." `steer`
+   * delivers the message into the running loop, which runs it as another turn
+   * of the same loop (one `agent_settled` covers both). `followUp` waits for
+   * the loop to finish instead.
+   */
+  async prompt(message: string, images: unknown[] = [], streamingBehavior?: PiStreamingBehavior): Promise<void> {
+    const res = await this.request({
+      type: 'prompt',
+      message,
+      images,
+      ...(streamingBehavior ? { streamingBehavior } : {})
+    })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 

@@ -26,7 +26,7 @@ export class FakePiRpcProcess {
   private handlers: Array<(ev: PiRpcEvent) => void> = []
 
   // spies
-  readonly prompts: Array<{ message: string; attachments: unknown[] }> = []
+  readonly prompts: Array<{ message: string; attachments: unknown[]; streamingBehavior?: string }> = []
   readonly extensionUiResponses: unknown[] = []
   abortCount = 0
 
@@ -64,8 +64,8 @@ export class FakePiRpcProcess {
     this.promptEvents = events
   }
 
-  async prompt(message: string, attachments: unknown[] = []): Promise<void> {
-    this.prompts.push({ message, attachments })
+  async prompt(message: string, attachments: unknown[] = [], streamingBehavior?: string): Promise<void> {
+    this.prompts.push({ message, attachments, streamingBehavior })
     if (this.promptEvents) {
       const events = this.promptEvents
       this.promptEvents = null

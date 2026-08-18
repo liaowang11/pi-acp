@@ -385,6 +385,29 @@ export class PiAcpSession {
     return turnPromise
   }
 
+  /**
+   * Deliver a message to the turn that is already running, instead of queueing
+   * it behind that turn the way `prompt` does.
+   *
+   * Returns `injected` once pi has taken the message, or `noRunningTurn` when
+   * there is nothing to steer. The idle case is deliberately not forwarded: pi
+   * accepts a steering message while idle and runs it as its own agent loop,
+   * whose output would stream with no ACP request owning it. The caller decides
+   * what to do instead (normally re-send it as a `session/prompt`).
+   *
+   * No turn is created and the queue is untouched. pi runs the steered message
+   * as another turn of the same agent loop, so the single `agent_settled` that
+   * ends the loop completes the ACP prompt already in flight, whose request
+   * keeps owning the streamed output, usage and stop reason.
+   */
+  async steer(message: string, images: unknown[] = []): Promise<'injected' | 'noRunningTurn'> {
+    if (!this.pendingTurn) return 'noRunningTurn'
+
+    // pi RPC mode disables slash command expansion, same as `prompt` above.
+    await this.proc.prompt(expandSlashCommand(message, this.fileCommands), images, 'steer')
+    return 'injected'
+  }
+
   async cancel(): Promise<void> {
     // Cancel current and clear any queued prompts.
     this.cancelRequested = true

@@ -63,6 +63,12 @@ type AdvertisedModel = {
 
 const MODEL_CONFIG_ID = 'model'
 const THOUGHT_LEVEL_CONFIG_ID = 'thought_level'
+/**
+ * ACP extension request that delivers a prompt into the running turn. Not part
+ * of the ACP schema; the standards-track equivalent is `session/inject`
+ * (agentclientprotocol/agent-client-protocol#1261), still open.
+ */
+const SESSION_STEERING_METHOD = '_session/steering'
 const LEGACY_THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
 
 function builtinAvailableCommands(): AvailableCommand[] {
@@ -271,8 +277,70 @@ export class PiAcpAgent implements ACPAgent {
           delete: {},
           fork: {}
         }
+      },
+      // Steering is an ACP extension, not part of the schema, and other adapters
+      // (claude-agent-acp, codex-acp) advertise it at the top-level _meta, a
+      // sibling of agentCapabilities rather than a member of it.
+      _meta: {
+        steering: { supported: true }
       }
     }
+  }
+
+  /**
+   * Handle extension requests that are not part of the ACP schema.
+   *
+   * The SDK routes every unknown method here, so anything this adapter does not
+   * implement has to keep failing as an unknown method.
+   */
+  async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (method === SESSION_STEERING_METHOD) {
+      return await this.steerSession(params)
+    }
+
+    throw RequestError.methodNotFound(method)
+  }
+
+  /**
+   * Deliver a prompt to the turn that is already running (`_session/steering`).
+   *
+   * Outcomes, matching the extension as implemented by the Claude and Codex
+   * adapters:
+   *
+   *   injected        pi took the message into the running turn.  Its output
+   *                   streams under the `session/prompt` already in flight.
+   *   promptRequired  no turn was running, so the message was NOT consumed and
+   *                   the client delivers it as a normal `session/prompt`.
+   *   failed          pi rejected the message; also not consumed.
+   *
+   * Unlike the Claude adapter, an idle session never starts a detached turn
+   * here: that leaves the output with no request owning its result, and pi
+   * would happily run it (it accepts steering messages while idle).
+   */
+  private async steerSession(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const sessionId = params.sessionId
+    if (typeof sessionId !== 'string' || !sessionId) {
+      throw RequestError.invalidParams('steering requires a non-empty sessionId')
+    }
+    if (!Array.isArray(params.prompt) || params.prompt.length === 0) {
+      throw RequestError.invalidParams('steering requires a non-empty prompt array')
+    }
+
+    const session = await this.restoreSession(sessionId)
+    const { message, images } = promptToPiMessage(params.prompt as PromptRequest['prompt'])
+
+    let outcome: 'injected' | 'noRunningTurn'
+    try {
+      outcome = await session.steer(message, images)
+    } catch (e: any) {
+      return { outcome: 'failed', error: String(e?.message ?? e) }
+    }
+
+    if (outcome === 'noRunningTurn') {
+      return { outcome: 'promptRequired', reason: 'noRunningTurn' }
+    }
+
+    return { outcome: 'injected' }
   }
 
   async newSession(params: NewSessionRequest) {
