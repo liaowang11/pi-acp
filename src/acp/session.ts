@@ -27,6 +27,7 @@ import {
   isBashTool
 } from './translate/bash.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import { toUsageUpdate, type PiSessionStats, type UsageUpdate } from './usage.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -41,6 +42,7 @@ export type StopReason = 'end_turn' | 'cancelled' | 'error'
 type PendingTurn = {
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
+  token: number
 }
 
 type QueuedTurn = {
@@ -273,6 +275,9 @@ export class PiAcpSession {
 
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
+  // Monotonic id stamped on each turn so a delayed completion (the get_state fence below) or a
+  // stray pi event can only resolve the turn it belongs to, never a later one.
+  private turnSeq = 0
   private readonly turnQueue: QueuedTurn[] = []
   // Track tool call statuses and ensure they are monotonic (pending -> in_progress -> completed).
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
@@ -339,7 +344,12 @@ export class PiAcpSession {
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject }
+      const queued: QueuedTurn = {
+        message: expandedMessage,
+        images,
+        resolve,
+        reject
+      }
 
       // If a turn is already running, enqueue.
       if (this.pendingTurn) {
@@ -398,13 +408,14 @@ export class PiAcpSession {
     return this.cancelRequested
   }
 
-  private emit(update: SessionUpdate): void {
-    // Serialize update delivery.
+  private emit(update: SessionUpdate | UsageUpdate): void {
+    // Serialize update delivery. `usage_update` is not yet in the SDK's SessionUpdate
+    // union (ACP RFD #22); the cast confines that single gap to one place.
     this.lastEmit = this.lastEmit
       .then(() =>
         this.conn.sessionUpdate({
           sessionId: this.sessionId,
-          update
+          update: update as SessionUpdate
         })
       )
       .catch(() => {
@@ -471,11 +482,43 @@ export class PiAcpSession {
     this.bashOutputSnapshots.delete(toolCallId)
   }
 
+  private async emitUsageUpdate(): Promise<void> {
+    try {
+      const update = toUsageUpdate((await this.proc.getSessionStats()) as PiSessionStats)
+      if (update) this.emit(update)
+    } catch {
+      // Usage is best-effort; never break the session if stats are unavailable.
+    }
+  }
+
+  private completeTurn(token: number, reason: StopReason): void {
+    if (this.pendingTurn?.token !== token) return
+
+    this.pendingTurn.resolve(reason)
+    this.pendingTurn = null
+    this.inAgentLoop = false
+
+    const next = this.turnQueue.shift()
+    if (next) {
+      this.emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+      })
+      this.startTurn(next)
+    } else {
+      this.emit({
+        sessionUpdate: 'session_info_update',
+        _meta: { piAcp: { queueDepth: 0, running: false } }
+      })
+    }
+  }
+
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
 
-    this.pendingTurn = { resolve: t.resolve, reject: t.reject }
+    const token = ++this.turnSeq
+    this.pendingTurn = { resolve: t.resolve, reject: t.reject, token }
 
     // Publish queue depth (0 because we're starting the turn now).
     this.emit({
@@ -483,34 +526,80 @@ export class PiAcpSession {
       _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
     })
 
-    // Kick off pi, but completion is determined by pi events, not the RPC response.
-    // The prompt RPC only acknowledges acceptance; retry, compaction, or queued
-    // continuations may emit multiple `agent_end` events before `agent_settled`.
-    this.proc.prompt(t.message, t.images).catch(err => {
-      // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
-      // Also ensure we flush any already-enqueued updates first.
-      void this.flushEmits().finally(() => {
-        // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
-        const authErr = maybeAuthRequiredError(err)
-        if (authErr) {
-          this.pendingTurn?.reject(authErr)
-        } else {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
-        }
-
-        this.pendingTurn = null
-        this.inAgentLoop = false
-
-        // If the prompt failed, do not automatically proceed—pi may be unhealthy.
-        // But we still clear the queueDepth metadata.
-        this.emit({
-          sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
-        })
+    // Kick off pi. Completion is normally determined by pi's `agent_settled` event, not the RPC
+    // response: retry, compaction, or queued continuations may emit multiple `agent_end` events,
+    // and the prompt RPC response is only an early "preflight accepted" ack emitted before the
+    // agent loop runs. The ambiguous case is handled in maybeCompleteAfterAck.
+    this.proc
+      .prompt(t.message, t.images)
+      .then(() => {
+        void this.maybeCompleteAfterAck(token, t.message)
       })
-      void err
-    })
+      .catch(err => {
+        // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
+        // Also ensure we flush any already-enqueued updates first.
+        void this.flushEmits().finally(() => {
+          if (this.pendingTurn?.token !== token) return
+
+          // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
+          const authErr = maybeAuthRequiredError(err)
+          if (authErr) {
+            this.pendingTurn.reject(authErr)
+          } else {
+            this.pendingTurn.resolve(this.cancelRequested ? 'cancelled' : 'error')
+          }
+
+          this.pendingTurn = null
+          this.inAgentLoop = false
+
+          // If the prompt failed, do not automatically proceed—pi may be unhealthy.
+          // But we still clear the queueDepth metadata.
+          this.emit({
+            sessionUpdate: 'session_info_update',
+            _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+          })
+        })
+        void err
+      })
+  }
+
+  /**
+   * Decide turn completion once pi has acked a slash-command prompt.
+   *
+   * The prompt RPC response is an early "preflight accepted" ack, emitted before pi's agent loop
+   * runs. A slash command may run no agent loop at all (a pure UI/state command, which never emits
+   * `agent_settled`), or it may queue a hidden follow-up turn (e.g. `/goal <objective>`). pi runs the
+   * command handler — including any queued follow-up that flips `isStreaming` / increments
+   * `pendingMessageCount` — before emitting this ack, so the get_state probe below authoritatively
+   * distinguishes the two: if pi reports any in-flight or queued work, keep the turn open and let
+   * `agent_settled` complete it; otherwise the command finished synchronously and the turn ends now.
+   *
+   * Non-slash prompts always run an agent loop, so they skip this and complete on `agent_settled`.
+   */
+  private async maybeCompleteAfterAck(token: number, message: string): Promise<void> {
+    if (this.inAgentLoop || this.pendingTurn?.token !== token) return
+    if (!message.trimStart().startsWith('/')) return
+
+    let busy = false
+    try {
+      const state = (await this.proc.getState()) as {
+        isStreaming?: unknown
+        isCompacting?: unknown
+        pendingMessageCount?: unknown
+      } | null
+      busy =
+        Boolean(state?.isStreaming) ||
+        Boolean(state?.isCompacting) ||
+        (typeof state?.pendingMessageCount === 'number' && state.pendingMessageCount > 0)
+    } catch {
+      // If pi's state is unreachable, prefer completing the turn over hanging forever.
+    }
+
+    if (busy || this.inAgentLoop || this.pendingTurn?.token !== token) return
+
+    await this.flushEmits()
+    if (this.inAgentLoop || this.pendingTurn?.token !== token) return
+    this.completeTurn(token, this.cancelRequested ? 'cancelled' : 'end_turn')
   }
 
   private handlePiEvent(ev: PiRpcEvent) {
@@ -796,25 +885,29 @@ export class PiAcpSession {
         break
       }
 
-      case 'auto_compaction_start': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Context nearing limit, running automatic compaction...'
-          } satisfies ContentBlock
-        })
+      case 'compaction_start': {
+        if (stringProp(ev, 'reason') !== 'manual') {
+          this.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: 'Context nearing limit, running automatic compaction...'
+            } satisfies ContentBlock
+          })
+        }
         break
       }
 
-      case 'auto_compaction_end': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Automatic compaction finished; context was summarized to continue the session.'
-          } satisfies ContentBlock
-        })
+      case 'compaction_end': {
+        if (stringProp(ev, 'reason') !== 'manual') {
+          this.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: 'Automatic compaction finished; context was summarized to continue the session.'
+            } satisfies ContentBlock
+          })
+        }
         break
       }
 
@@ -837,28 +930,14 @@ export class PiAcpSession {
       }
 
       case 'agent_settled': {
-        // Ensure all updates derived from pi events are delivered before we resolve
-        // the ACP `session/prompt` request.
-        void this.flushEmits().finally(() => {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-          this.pendingTurn?.resolve(reason)
-          this.pendingTurn = null
-          this.inAgentLoop = false
-
-          // Start next queued prompt, if any.
-          const next = this.turnQueue.shift()
-          if (next) {
-            this.emit({
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-            })
-            this.startTurn(next)
-          } else {
-            this.emit({
-              sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
-            })
-          }
+        // Bind this completion to the current turn so a duplicate or stray settlement can resolve
+        // at most that same turn, never a later queued one.
+        if (!this.pendingTurn) break
+        const token = this.pendingTurn.token
+        void this.emitUsageUpdate().finally(() => {
+          void this.flushEmits().finally(() => {
+            this.completeTurn(token, this.cancelRequested ? 'cancelled' : 'end_turn')
+          })
         })
         break
       }

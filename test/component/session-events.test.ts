@@ -393,7 +393,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_retry_end', async () => {
   })
 })
 
-test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async () => {
+test('PiAcpSession: emits agent_message_chunk for compaction_start', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -406,7 +406,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async 
     fileCommands: []
   })
 
-  proc.emit({ type: 'auto_compaction_start' } as any)
+  proc.emit({ type: 'compaction_start', reason: 'threshold' } as any)
 
   await new Promise(r => setTimeout(r, 0))
 
@@ -417,7 +417,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async 
   })
 })
 
-test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async () => {
+test('PiAcpSession: emits agent_message_chunk for compaction_end', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -430,7 +430,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async ()
     fileCommands: []
   })
 
-  proc.emit({ type: 'auto_compaction_end' } as any)
+  proc.emit({ type: 'compaction_end', reason: 'threshold', willRetry: false } as any)
 
   await new Promise(r => setTimeout(r, 0))
 
@@ -899,4 +899,454 @@ test('PiAcpSession: defaults notify severity to info when notifyType is absent',
   assert.deepEqual((conn.updates[0]!.update as any)._meta, {
     piAcp: { notify: { level: 'info' } }
   })
+})
+
+test('PiAcpSession: a TUI-only extension command that emits nothing resolves end_turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Simulate /usage: a TUI-overlay command whose ctx.ui.custom() is a no-op in pi RPC mode, so the
+  // handler returns having emitted no events and started no agent loop. pi reports idle at the ack.
+  const reason = await session.prompt('/usage')
+  assert.equal(reason, 'end_turn')
+  assert.equal(proc.abortCount, 0)
+})
+
+test('PiAcpSession: extension command with setStatus only resolves end_turn (no agent events)', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Simulate /cache graph: setStatus emitted before prompt resolves, no agent events ever.
+  proc.queuePromptEvents([{ type: 'extension_ui_request', id: 'ext-1', method: 'setStatus', statusKey: 'codex-goal' }])
+
+  const p = session.prompt('/cache graph')
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+})
+
+test('PiAcpSession: extension command with notify resolves end_turn (no agent events)', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Simulate /cache: setStatus then notify before prompt resolves
+  proc.queuePromptEvents([
+    { type: 'extension_ui_request', id: 'ext-1', method: 'setStatus', statusKey: 'codex-goal' },
+    {
+      type: 'extension_ui_request',
+      id: 'ext-2',
+      method: 'notify',
+      message: 'Usage: /cache graph | /cache stats | /cache export',
+      notifyType: 'info'
+    }
+  ])
+
+  const p = session.prompt('/cache')
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+
+  // Verify the notify content was surfaced as agent_message_chunk
+  const messages = conn.updates.filter(u => u.update.sessionUpdate === 'agent_message_chunk')
+  assert.ok(messages.length >= 1, 'expected at least one agent_message_chunk for notify content')
+})
+
+test('PiAcpSession: normal prompt after extension command works correctly', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // First prompt: extension command
+  proc.queuePromptEvents([{ type: 'extension_ui_request', id: 'ext-1', method: 'setStatus', statusKey: 'codex-goal' }])
+  const p1 = session.prompt('/cache graph')
+  const reason1 = await p1
+  assert.equal(reason1, 'end_turn')
+
+  // Second prompt: normal LLM prompt — agent events arrive in same batch as prompt resolution
+  proc.queuePromptEvents([
+    { type: 'agent_start' },
+    { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'Hi!' } },
+    { type: 'turn_end' },
+    { type: 'agent_end' },
+    { type: 'agent_settled' }
+  ])
+  const p2 = session.prompt('say hi')
+  const reason2 = await p2
+  assert.equal(reason2, 'end_turn')
+})
+
+test('PiAcpSession: does not complete a normal prompt early when agent_start arrives after the prompt ack', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Real pi ordering: the prompt ack is emitted before the agent loop starts, and pi has
+  // already set isStreaming=true by then. agent_start arrives only afterwards.
+  proc.streaming = true
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // Let the prompt ack resolve and the get_state fence run. Because pi reports isStreaming, the
+  // turn must NOT be completed yet — agent settlement is still to come.
+  await new Promise(r => setTimeout(r, 0))
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must not resolve before agent_settled')
+
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'turn_end' })
+  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
+
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+  assert.equal(resolved, true)
+})
+
+test('PiAcpSession: does not complete a normal prompt early when get_state reports not streaming before later deltas arrive', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // A normal prompt can still emit deltas after the prompt ack even if an immediate get_state
+  // check transiently reports isStreaming=false. The turn must stay open until agent_settled.
+  await new Promise(r => setTimeout(r, 0))
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must not resolve before later prompt deltas arrive')
+
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'Let' } })
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'Hi!' } })
+  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
+
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+  assert.equal(resolved, true)
+})
+
+test('PiAcpSession: a duplicate agent_end does not resolve a queued follow-up turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Both turns are normal prompts; pi keeps reporting isStreaming across the queued turns.
+  proc.streaming = true
+
+  const first = session.prompt('one')
+  proc.emit({ type: 'agent_start' })
+
+  let secondResolved = false
+  const second = session.prompt('two').then(reason => {
+    secondResolved = true
+    return reason
+  })
+
+  // pi ends turn one, then erroneously emits a second agent_end.
+  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
+
+  const r1 = await first
+  assert.equal(r1, 'end_turn')
+
+  // The stray agent_end must not have completed the queued turn two.
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(secondResolved, false, 'duplicate agent_end must not resolve turn two')
+
+  // Turn two completes on its own settlement.
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
+
+  const r2 = await second
+  assert.equal(r2, 'end_turn')
+})
+
+test('PiAcpSession: keeps an extension-command turn open while pi reports a queued follow-up', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // A /goal-style extension command records its goal and queues a hidden follow-up turn. At the
+  // prompt ack pi has not begun streaming yet, but already reports the queued work via get_state.
+  // The adapter must not complete the ACP turn at the ack; it must wait for the follow-up loop.
+  proc.streaming = false
+  proc.pendingMessages = 1
+
+  let resolved = false
+  const p = session.prompt('/goal build the thing').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must stay open while pi reports a queued follow-up')
+
+  // The follow-up loop runs and finishes; its output must be delivered inside this turn.
+  proc.pendingMessages = 0
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'working on goal' } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'end_turn')
+  assert.equal(resolved, true)
+  const answer = conn.updates.find(
+    u => u.update.sessionUpdate === 'agent_message_chunk' && (u.update as any).content?.text === 'working on goal'
+  )
+  assert.ok(answer, 'follow-up output must be delivered as an in-turn session/update')
+})
+
+test('PiAcpSession: keeps the turn open across an auto-retry agent_end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // First attempt fails with a retryable error. pi signals it will auto-retry by setting
+  // willRetry on the agent_end, then runs a fresh agent loop for the retry.
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end', willRetry: true })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must stay open while pi auto-retries')
+
+  // The retry produces the real answer; its events must arrive while the turn is still active.
+  proc.emit({ type: 'auto_retry_start', attempt: 1, maxAttempts: 5, delayMs: 2000 })
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'answer' } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'end_turn')
+
+  const answer = conn.updates.find(
+    u => u.update.sessionUpdate === 'agent_message_chunk' && (u.update as any).content?.text === 'answer'
+  )
+  assert.ok(answer, 'retried answer must be delivered as an in-turn session/update')
+})
+
+test('PiAcpSession: keeps the turn open across overflow compaction-and-retry', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // Context overflow is not a transient retry (willRetry stays false on the agent_end); pi recovers
+  // by compacting and running another agent loop. The compaction_start arrives during the agent_end
+  // completion's settle and must hold the turn open.
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'compaction_start', reason: 'overflow' })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must stay open through overflow compaction')
+
+  proc.emit({ type: 'compaction_end', reason: 'overflow', willRetry: true })
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must stay open until the post-compaction loop ends')
+
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'answer' } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'end_turn')
+
+  const answer = conn.updates.find(
+    u => u.update.sessionUpdate === 'agent_message_chunk' && (u.update as any).content?.text === 'answer'
+  )
+  assert.ok(answer, 'post-compaction answer must be delivered as an in-turn session/update')
+})
+
+test('PiAcpSession: completes the turn after threshold compaction with no continuation', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // The agentic answer finishes, then pi compacts at the threshold. Threshold compaction runs no
+  // further loop (willRetry false), so the turn completes once compaction ends.
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'done' } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'compaction_start', reason: 'threshold' })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must not resolve while threshold compaction runs')
+
+  proc.emit({ type: 'compaction_end', reason: 'threshold', willRetry: false })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await p, 'end_turn')
+})
+
+test('PiAcpSession: keeps the turn open when pi continues with a queued follow-up', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // pi drains a queued follow-up by starting a fresh agent loop after the first agent_end. The new
+  // agent_start must cancel the first agent_end's pending completion.
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'agent_start' })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false, 'turn must stay open for the queued follow-up loop')
+
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'followup' } })
+  proc.emit({ type: 'agent_end', willRetry: false })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await p, 'end_turn')
+})
+
+test('PiAcpSession: ignores manual compaction (no auto-compaction notice, no completion)', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Manual /compact is driven by its own builtin; its compaction events must not surface the
+  // automatic-compaction notice.
+  proc.emit({ type: 'compaction_start', reason: 'manual' })
+  proc.emit({ type: 'compaction_end', reason: 'manual', willRetry: false })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(conn.updates.length, 0)
 })

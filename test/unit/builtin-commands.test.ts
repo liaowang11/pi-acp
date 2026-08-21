@@ -58,3 +58,73 @@ test('PiAcpAgent: /name sets session display name adapter-side', async () => {
   const last = conn.updates.at(-1)
   assert.match((last as any).update.content.text, /Session name set: My Session/)
 })
+
+test('PiAcpAgent: extension commands run on the normal prompt path', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+  proc.getCommands = async () => ({ commands: [{ name: 'goal', source: 'extension' }] })
+
+  let promptCall: { message: string; images: unknown[]; opts: unknown } | null = null
+  const session = {
+    sessionId: 's1',
+    proc,
+    fileCommands: [],
+    prompt: async (message: string, images: unknown[], opts: unknown) => {
+      promptCall = { message, images, opts }
+      return 'end_turn'
+    },
+    wasCancelRequested: () => false
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  // Extension commands such as /goal may queue a hidden follow-up agent turn. They must go through
+  // the normal completion path so the ACP turn stays open until pi is idle, not be force-completed
+  // at the prompt ack.
+  const res = await agent.prompt({
+    sessionId: 's1',
+    prompt: [{ type: 'text', text: '/goal build the thing' }]
+  } as any)
+
+  assert.equal(res.stopReason, 'end_turn')
+  assert.deepEqual(promptCall, {
+    message: '/goal build the thing',
+    images: [],
+    opts: undefined
+  })
+})
+
+test('PiAcpAgent: prompt-template commands stay on the normal prompt path', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+  proc.getCommands = async () => ({ commands: [{ name: 'review', source: 'prompt' }] })
+
+  let promptCall: { message: string; images: unknown[]; opts: unknown } | null = null
+  const session = {
+    sessionId: 's1',
+    proc,
+    fileCommands: [],
+    isExtensionCommand: async () => false,
+    prompt: async (message: string, images: unknown[], opts: unknown) => {
+      promptCall = { message, images, opts }
+      return 'end_turn'
+    },
+    wasCancelRequested: () => false
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  const res = await agent.prompt({
+    sessionId: 's1',
+    prompt: [{ type: 'text', text: '/review src/acp/session.ts' }]
+  } as any)
+
+  assert.equal(res.stopReason, 'end_turn')
+  assert.deepEqual(promptCall, {
+    message: '/review src/acp/session.ts',
+    images: [],
+    opts: undefined
+  })
+})
