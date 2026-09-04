@@ -161,7 +161,7 @@ Loaded from:
 Other built-in commands:
 
 - `/model` - not implemented (use the model selector UI in Zed)
-- `/thinking` - maps to 'mode' selector in Zed
+- `/thinking` - not implemented (use the Thinking session config option in Zed)
 - `/clear` - not implemented (use ACP client 'new' command)
 
 #### 3) Skill commands

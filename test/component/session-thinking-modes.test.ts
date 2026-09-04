@@ -9,14 +9,11 @@ class FakeConn {
   }
 }
 
-test('PiAcpAgent: setSessionMode maps to pi setThinkingLevel + emits current_mode_update', async () => {
+test('PiAcpAgent: does not expose session modes', async () => {
   const conn = new FakeConn()
   const agent = new PiAcpAgent(conn as any)
 
-  // Create a fake session by calling newSession is heavyweight (spawns pi).
-  // Instead, reach into session manager via loadSession isn't possible either.
-  // So we unit-test the mapping via a minimal fake session manager would require refactor.
-  // For now we just assert the method exists and rejects unknown mode IDs.
-
-  await assert.rejects(() => agent.setSessionMode({ sessionId: 'nope', modeId: 'invalid' } as any), /invalid params/i)
+  // Session modes were removed: pi has no ask/architect/code-style modes, and
+  // thinking level is exposed via the thought_level config option instead.
+  assert.equal(typeof (agent as any).setSessionMode, 'undefined')
 })

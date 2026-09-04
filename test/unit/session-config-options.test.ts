@@ -61,7 +61,6 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
     const result = await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
 
     assert.equal(result.models?.currentModelId, 'test/beta')
-    assert.equal(result.modes?.currentModeId, 'high')
     assert.deepEqual(result.configOptions, [
       {
         type: 'select',
@@ -146,7 +145,7 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
   ])
 })
 
-test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and emits sync updates', async () => {
+test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and emits config_option_update', async () => {
   const conn = new FakeAgentSideConnection()
   const state = {
     thinkingLevel: 'medium',
@@ -188,13 +187,6 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
   assert.deepEqual(thinkingLevels, ['max'])
   assert.equal(result.configOptions.find(option => option.id === 'thought_level')?.currentValue, 'max')
   assert.deepEqual(conn.updates, [
-    {
-      sessionId: 's1',
-      update: {
-        sessionUpdate: 'current_mode_update',
-        currentModeId: 'max'
-      }
-    },
     {
       sessionId: 's1',
       update: {

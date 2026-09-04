@@ -17,8 +17,6 @@ import {
   type SessionInfo,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
-  type SetSessionModeRequest,
-  type SetSessionModeResponse,
   type StopReason,
   type DeleteSessionRequest,
   type DeleteSessionResponse,
@@ -437,7 +435,7 @@ export class PiAcpAgent implements ACPAgent {
       )
     }
 
-    const { configOptions, models, modes } = await getSessionConfiguration(session.proc, {
+    const { configOptions, models } = await getSessionConfiguration(session.proc, {
       state,
       availableModels
     })
@@ -471,7 +469,6 @@ export class PiAcpAgent implements ACPAgent {
       sessionId: session.sessionId,
       configOptions,
       models,
-      modes,
       _meta: {
         piAcp: {
           startupInfo: preludeText || null
@@ -1199,12 +1196,11 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    const { configOptions, models, modes } = await getSessionConfiguration(proc)
+    const { configOptions, models } = await getSessionConfiguration(proc)
 
     const response = {
       configOptions,
       models,
-      modes,
       _meta: {
         piAcp: {
           startupInfo: null
@@ -1279,30 +1275,6 @@ export class PiAcpAgent implements ACPAgent {
     await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
   }
 
-  async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    const session = await this.restoreSession(params.sessionId)
-
-    const mode = String(params.modeId)
-    if (!isThinkingLevel(mode)) {
-      throw RequestError.invalidParams(`Unknown modeId: ${mode}`)
-    }
-
-    await session.proc.setThinkingLevel(mode)
-
-    // Let the client know the current mode changed (keeps the dropdown in sync).
-    void this.conn.sessionUpdate({
-      sessionId: session.sessionId,
-      update: {
-        sessionUpdate: 'current_mode_update',
-        currentModeId: mode
-      }
-    })
-
-    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
-
-    return {}
-  }
-
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     const session = await this.restoreSession(params.sessionId)
     const configId = String(params.configId)
@@ -1319,14 +1291,6 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       await session.proc.setThinkingLevel(params.value)
-
-      void this.conn.sessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'current_mode_update',
-          currentModeId: params.value
-        }
-      })
     } else {
       throw RequestError.invalidParams(`Unknown config option: ${configId}`)
     }
@@ -1340,16 +1304,16 @@ function isThinkingLevel(x: string): x is ThinkingLevel {
   return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh' || x === 'max'
 }
 
-async function getThinkingState(
+async function getThoughtLevelState(
   proc: PiRpcProcess,
   pre?: { state?: any | null }
 ): Promise<{
-  availableModes: Array<{
-    id: string
+  currentValue: string
+  options: Array<{
+    value: string
     name: string
     description?: string | null
   }>
-  currentModeId: string
 }> {
   // Ask pi for current thinking level.
   let current: ThinkingLevel = 'medium'
@@ -1393,9 +1357,9 @@ async function getThinkingState(
   if (!available.includes(current)) current = available[0] ?? 'off'
 
   return {
-    currentModeId: current,
-    availableModes: available.map(id => ({
-      id,
+    currentValue: current,
+    options: available.map(id => ({
+      value: id,
       name: `Thinking: ${id}`,
       description: null
     }))
@@ -1411,21 +1375,15 @@ async function getSessionConfiguration(
     availableModels: AdvertisedModel[]
     currentModelId: string
   } | null
-  modes: {
-    availableModes: Array<{
-      id: string
-      name: string
-      description?: string | null
-    }>
-    currentModeId: string
-  }
 }> {
-  const [models, modes] = await Promise.all([getModelState(proc, pre), getThinkingState(proc, { state: pre?.state })])
+  const [models, thoughtLevel] = await Promise.all([
+    getModelState(proc, pre),
+    getThoughtLevelState(proc, { state: pre?.state })
+  ])
 
   return {
-    configOptions: buildConfigOptions({ models, modes }),
-    models,
-    modes
+    configOptions: buildConfigOptions({ models, thoughtLevel }),
+    models
   }
 }
 
@@ -1434,13 +1392,13 @@ function buildConfigOptions(state: {
     availableModels: AdvertisedModel[]
     currentModelId: string
   } | null
-  modes: {
-    availableModes: Array<{
-      id: string
+  thoughtLevel: {
+    options: Array<{
+      value: string
       name: string
       description?: string | null
     }>
-    currentModeId: string
+    currentValue: string
   }
 }): SessionConfigOption[] {
   const configOptions: SessionConfigOption[] = [
@@ -1450,11 +1408,11 @@ function buildConfigOptions(state: {
       category: 'thought_level',
       name: 'Thinking',
       description: 'Set the reasoning effort for this session',
-      currentValue: state.modes.currentModeId,
-      options: state.modes.availableModes.map(mode => ({
-        value: mode.id,
-        name: mode.name,
-        description: mode.description ?? null
+      currentValue: state.thoughtLevel.currentValue,
+      options: state.thoughtLevel.options.map(option => ({
+        value: option.value,
+        name: option.name,
+        description: option.description ?? null
       }))
     }
   ]
