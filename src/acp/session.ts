@@ -955,6 +955,17 @@ export class PiAcpSession {
         break
       }
 
+      case 'session_info_changed': {
+        // Fired whenever the session name changes by any means: `/name`, the `set_session_name`
+        // RPC command, or an extension calling `pi.setSessionName()` (e.g. auto-titling extensions).
+        this.emit({
+          sessionUpdate: 'session_info_update',
+          title: stringProp(ev, 'name'),
+          updatedAt: new Date().toISOString()
+        })
+        break
+      }
+
       case 'agent_settled': {
         // Bind this completion to the current turn so a duplicate or stray settlement can resolve
         // at most that same turn, never a later queued one.
