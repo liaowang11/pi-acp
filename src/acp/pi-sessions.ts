@@ -1,7 +1,10 @@
 import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs'
 import type { Stats } from 'node:fs'
-import { homedir } from 'node:os'
-import { join, resolve, isAbsolute } from 'node:path'
+import { join, resolve, isAbsolute, relative } from 'node:path'
+
+import { getPiAcpSessionIndexPath, getPiAgentDir } from './paths.js'
+import { loadSessionIndex, saveSessionIndex } from './session-index.js'
+import type { SessionIndex, SessionIndexEntry } from './session-index.js'
 
 export type PiSessionListItem = {
   sessionId: string
@@ -18,12 +21,6 @@ const DEFAULT_HEAD_BYTES = 64 * 1024
 // sessions into memory.
 const FALLBACK_MAX_BYTES = 512 * 1024
 const FALLBACK_MAX_LINES = 2000
-
-function getPiAgentDir(): string {
-  // pi supports overriding config dir via PI_CODING_AGENT_DIR.
-  // See pi README.
-  return process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR) : join(homedir(), '.pi', 'agent')
-}
 
 function readSessionDirFromSettings(agentDir: string): string | null {
   const settingsPath = join(agentDir, 'settings.json')
@@ -291,12 +288,25 @@ function pickFallbackTitleFromHead(path: string): string | null {
   return wider ? pickFirstUserMessageTitle(wider.text) : null
 }
 
-export function listPiSessions(): PiSessionListItem[] {
+export type ListPiSessionsOptions = {
+  /**
+   * Session index cache file. Defaults to the per-agent-dir index; pass null to always
+   * read every session file.
+   */
+  indexFile?: string | null
+}
+
+export function listPiSessions(options: ListPiSessionsOptions = {}): PiSessionListItem[] {
   const sessionsDir = getPiSessionsDir()
   const files: string[] = []
   walkJsonlFiles(sessionsDir, files)
 
+  const indexFile = options.indexFile === undefined ? getPiAcpSessionIndexPath() : options.indexFile
+  const cached: SessionIndex = indexFile ? loadSessionIndex(indexFile, sessionsDir) : new Map()
+  const nextIndex: SessionIndex = new Map()
+
   const items: PiSessionListItem[] = []
+  let indexChanged = false
 
   for (const file of files) {
     let st: Stats
@@ -304,6 +314,20 @@ export function listPiSessions(): PiSessionListItem[] {
       st = statSync(file)
     } catch {
       // File disappeared between the walk and now.
+      continue
+    }
+
+    const key = relative(sessionsDir, file)
+    const cachedEntry = cached.get(key)
+    if (cachedEntry && cachedEntry.size === st.size && cachedEntry.mtimeMs === st.mtimeMs) {
+      nextIndex.set(key, cachedEntry)
+      items.push({
+        sessionId: cachedEntry.sessionId,
+        cwd: cachedEntry.cwd,
+        title: cachedEntry.title,
+        updatedAt: cachedEntry.updatedAt,
+        sessionFile: file
+      })
       continue
     }
 
@@ -338,6 +362,19 @@ export function listPiSessions(): PiSessionListItem[] {
       title = pickFallbackTitleFromHead(file)
     }
 
+    // The entry is keyed by the stat taken before reading, so a file that changes while
+    // it is read is re-read on the next listing instead of being cached as stable.
+    const entry: SessionIndexEntry = {
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      sessionId: header.sessionId,
+      cwd: header.cwd,
+      title,
+      updatedAt
+    }
+    nextIndex.set(key, entry)
+    indexChanged = true
+
     items.push({
       sessionId: header.sessionId,
       cwd: header.cwd,
@@ -346,6 +383,10 @@ export function listPiSessions(): PiSessionListItem[] {
       sessionFile: file
     })
   }
+
+  // A different entry count means files were added or removed.
+  if (nextIndex.size !== cached.size) indexChanged = true
+  if (indexFile && indexChanged) saveSessionIndex(indexFile, sessionsDir, nextIndex)
 
   // Sort most recent first.
   items.sort((a, b) => {
