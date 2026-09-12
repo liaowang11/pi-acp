@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs'
+import type { Stats } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve, isAbsolute } from 'node:path'
 
@@ -12,6 +13,11 @@ export type PiSessionListItem = {
 
 const DEFAULT_TAIL_BYTES = 256 * 1024
 const DEFAULT_HEAD_BYTES = 64 * 1024
+// First user messages are usually a few hundred bytes, but skill injections can make
+// them a single multi-hundred-KB line. Cap the fallback read instead of pulling whole
+// sessions into memory.
+const FALLBACK_MAX_BYTES = 512 * 1024
+const FALLBACK_MAX_LINES = 2000
 
 function getPiAgentDir(): string {
   // pi supports overriding config dir via PI_CODING_AGENT_DIR.
@@ -58,36 +64,55 @@ function walkJsonlFiles(dir: string, out: string[]) {
   }
 }
 
-function readFirstLine(path: string): string | null {
-  // Avoid reading the whole file.
-  const fd = openSync(path, 'r')
+// readSync may return fewer bytes than requested; fill the buffer so that a short read
+// cannot silently truncate a header line or a tail window.
+function readFully(fd: number, buf: Buffer, position: number): number {
+  let total = 0
+  while (total < buf.length) {
+    const n = readSync(fd, buf, total, buf.length - total, position + total)
+    if (n <= 0) break
+    total += n
+  }
+  return total
+}
+
+function readHead(path: string, maxBytes: number): { text: string; truncated: boolean } | null {
+  let fd: number | null = null
   try {
-    const buf = Buffer.alloc(DEFAULT_HEAD_BYTES)
-    const n = readSync(fd, buf, 0, buf.length, 0)
+    fd = openSync(path, 'r')
+    const buf = Buffer.alloc(maxBytes)
+    const n = readFully(fd, buf, 0)
     if (n <= 0) return null
-    const s = buf.subarray(0, n).toString('utf-8')
-    const idx = s.indexOf('\n')
-    return idx === -1 ? s.trim() : s.slice(0, idx).trim()
+    return { text: buf.subarray(0, n).toString('utf-8'), truncated: n === maxBytes }
   } catch {
     return null
   } finally {
-    try {
-      closeSync(fd)
-    } catch {
-      // ignore
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {
+        // ignore
+      }
     }
   }
 }
 
-function readTail(path: string, tailBytes = DEFAULT_TAIL_BYTES): string {
-  const st = statSync(path)
-  const start = Math.max(0, st.size - tailBytes)
-  const len = st.size - start
+function readFirstLine(path: string): string | null {
+  // Avoid reading the whole file.
+  const head = readHead(path, DEFAULT_HEAD_BYTES)
+  if (head === null) return null
+  const idx = head.text.indexOf('\n')
+  return (idx === -1 ? head.text : head.text.slice(0, idx)).trim()
+}
+
+function readTail(path: string, size: number, tailBytes = DEFAULT_TAIL_BYTES): string {
+  const start = Math.max(0, size - tailBytes)
+  const len = size - start
 
   const fd = openSync(path, 'r')
   try {
     const buf = Buffer.alloc(len)
-    const n = readSync(fd, buf, 0, buf.length, start)
+    const n = readFully(fd, buf, start)
     return buf.subarray(0, n).toString('utf-8')
   } finally {
     try {
@@ -227,39 +252,43 @@ function pickUpdatedAtFromTail(tail: string): string | null {
   return null
 }
 
-function pickFallbackTitleFromHead(path: string): string | null {
-  // Fallback to first user message.
-  // NOTE: we keep this simple: read a small head chunk and parse line-by-line.
-  try {
-    const raw = readFileSync(path, { encoding: 'utf8' })
-    const lines = raw.split(/\r?\n/)
-    for (const line0 of lines) {
-      const line = line0.trim()
-      if (!line) continue
-      try {
-        const obj = JSON.parse(line) as any
-        if (obj?.type === 'message' && obj?.message?.role === 'user') {
-          const content = obj?.message?.content
-          if (typeof content === 'string') return content.slice(0, 80)
-          if (Array.isArray(content)) {
-            const t = content.find((c: any) => c?.type === 'text' && typeof c?.text === 'string')
-            if (t?.text) return String(t.text).slice(0, 80)
-          }
-        }
-      } catch {
-        // ignore
-      }
+function pickFirstUserMessageTitle(text: string): string | null {
+  const lines = text.split(/\r?\n/)
+  const limit = Math.min(lines.length, FALLBACK_MAX_LINES)
 
-      // Avoid scanning extremely large files fully.
-      // If we didn't find a user message in the first ~2000 lines, give up.
-      // (Most sessions have it early.)
-      if (lines.length > 2000) break
+  for (let i = 0; i < limit; i++) {
+    const line = lines[i].trim()
+    if (!line) continue
+    try {
+      const obj = JSON.parse(line) as any
+      if (obj?.type === 'message' && obj?.message?.role === 'user') {
+        const content = obj?.message?.content
+        if (typeof content === 'string') return content.slice(0, 80)
+        if (Array.isArray(content)) {
+          const t = content.find((c: any) => c?.type === 'text' && typeof c?.text === 'string')
+          if (t?.text) return String(t.text).slice(0, 80)
+        }
+      }
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
   }
 
   return null
+}
+
+function pickFallbackTitleFromHead(path: string): string | null {
+  // Fallback to the first user message inside a bounded head window.
+  const head = readHead(path, DEFAULT_HEAD_BYTES)
+  if (head === null) return null
+
+  const title = pickFirstUserMessageTitle(head.text)
+  if (title || !head.truncated) return title
+
+  // Retry once with a bigger window: the first user message may be one huge line that
+  // reaches past the head window (the largest seen in practice is ~300KB).
+  const wider = readHead(path, FALLBACK_MAX_BYTES)
+  return wider ? pickFirstUserMessageTitle(wider.text) : null
 }
 
 export function listPiSessions(): PiSessionListItem[] {
@@ -270,6 +299,14 @@ export function listPiSessions(): PiSessionListItem[] {
   const items: PiSessionListItem[] = []
 
   for (const file of files) {
+    let st: Stats
+    try {
+      st = statSync(file)
+    } catch {
+      // File disappeared between the walk and now.
+      continue
+    }
+
     const first = readFirstLine(file)
     if (!first) continue
     const header = parseSessionHeader(first)
@@ -279,7 +316,7 @@ export function listPiSessions(): PiSessionListItem[] {
 
     let title: string | null = null
     try {
-      const tail = readTail(file)
+      const tail = readTail(file, st.size)
       title = pickTitleFromTail(tail)
       updatedAt = pickUpdatedAtFromTail(tail)
     } catch {
@@ -287,17 +324,14 @@ export function listPiSessions(): PiSessionListItem[] {
     }
 
     // If the session was named early and grew large, it may fall outside of the tail window.
-    if (!title) {
+    // When the tail window already covered the whole file, a full scan cannot find anything new.
+    if (!title && st.size > DEFAULT_TAIL_BYTES) {
       title = scanSessionInfoNameFromFile(file)
     }
 
     // Fallback for updatedAt when we couldn't parse timestamps from tail.
     if (!updatedAt) {
-      try {
-        updatedAt = statSync(file).mtime.toISOString()
-      } catch {
-        updatedAt = null
-      }
+      updatedAt = st.mtime.toISOString()
     }
 
     if (!title) {
